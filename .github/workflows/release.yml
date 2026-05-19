@@ -33,7 +33,7 @@ jobs:
       - name: Validate tag format
         if: github.event_name == 'workflow_dispatch'
         run: |
-          if [[ ! "${{ inputs.tag }}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(\.?[a-z][a-z0-9]*)?$ ]]; then
+          if [[ ! "${{ inputs.tag }}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(\.?[a-z][a-z0-9]*)?(\+|$) ]]; then
             echo "Error: Tag '${{ inputs.tag }}' does not match the expected format (e.g., v1.2.3 or v1.2.3.post1 or v1.2.3rc1)"
             exit 1
           fi
@@ -74,7 +74,11 @@ jobs:
               echo ""
               echo "Please update version.txt to match the release version before creating a release."
               echo "The tag should be 'v$VERSION_TXT' (e.g., if version.txt contains '1.2.3', tag should be 'v1.2.3')"
-              exit 1
+              if [ ${{ github.repository }} != flashinfer-ai/flashinfer ]; then
+                echo "Ignore the mismatch on fork repo"
+              else
+                exit 1
+              fi
             fi
 
             echo "is_pr=false" >> $GITHUB_OUTPUT
@@ -107,6 +111,9 @@ jobs:
         run: |
           echo "Building flashinfer-python..."
           echo "Git commit: $(git rev-parse HEAD)"
+          if [ -r variant.txt ]; then
+            export FLASHINFER_LOCAL_VERSION=$(cat variant.txt)
+          fi
           python -m build
           ls -lh dist/
 
@@ -190,6 +197,9 @@ jobs:
           export CUDA_MAJOR
           export CUDA_MINOR
           export FLASHINFER_LOCAL_VERSION="cu${CUDA_MAJOR}${CUDA_MINOR}"
+          if [ -r variant.txt ]; then
+            export FLASHINFER_LOCAL_VERSION=$(cat variant.txt).$FLASHINFER_LOCAL_VERSION
+          fi
 
           mkdir -p ${{ github.workspace }}/ci-cache
 
