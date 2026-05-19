@@ -25,6 +25,8 @@
 namespace flashinfer {
 
 DEFINE_HAS_MEMBER(v_scale)
+DEFINE_HAS_MEMBER(k_scale_per_token_head)
+DEFINE_HAS_MEMBER(v_scale_per_token_head)
 
 #define REGISTER_QUERY_TRANSFORM(params, q, ...)                                    \
   template <typename Params, typename T>                                            \

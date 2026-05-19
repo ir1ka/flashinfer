@@ -85,6 +85,8 @@ class BatchAttention:
         q_data_type: torch.dtype = torch.bfloat16,
         kv_data_type: torch.dtype = torch.bfloat16,
         use_profiler: bool = False,
+        use_k_scale_per_token_head: bool = False,
+        use_v_scale_per_token_head: bool = False,
     ) -> None:
         if logits_soft_cap is None:
             logits_soft_cap = 0.0
@@ -101,6 +103,8 @@ class BatchAttention:
             PosEncodingMode["NONE"].value,
             logits_soft_cap > 0.0,
             use_profiler,  # different compiler path
+            use_k_scale_per_token_head,
+            use_v_scale_per_token_head,
         )
         self.module = get_holistic_attention_module(*get_module_args)
 
@@ -117,6 +121,8 @@ class BatchAttention:
         self._num_kv_heads = num_kv_heads
         self._page_size = page_size
         self._use_profiler = use_profiler
+        self._use_k_scale_per_token_head = use_k_scale_per_token_head
+        self._use_v_scale_per_token_head = use_v_scale_per_token_head
 
         # No addtional buf allocated for CUDA graph tensor
         # Allocate outside FlashInfer
@@ -146,6 +152,8 @@ class BatchAttention:
         v_scale: Optional[torch.Tensor] = None,
         logits_soft_cap: float = 0.0,
         profiler_buffer: Optional[torch.Tensor] = None,
+        k_scale_per_token_head: Optional[torch.Tensor] = None,
+        v_scale_per_token_head: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if profiler_buffer is None:
             if self._use_profiler:
@@ -176,6 +184,41 @@ class BatchAttention:
         # profiler_buffer is optional
         profiler_args = (profiler_buffer,) if self._use_profiler else ()
 
+        # Build additional_args for per-token-head scales
+        # Order matches generate_additional_params(): all tensors first, then all scalars
+        additional_args = []
+        if self._use_k_scale_per_token_head:
+            if k_scale_per_token_head is not None:
+                k_scale_per_token_head = k_scale_per_token_head.contiguous()
+            additional_args.append(k_scale_per_token_head)
+        if self._use_v_scale_per_token_head:
+            if v_scale_per_token_head is not None:
+                v_scale_per_token_head = v_scale_per_token_head.contiguous()
+            additional_args.append(v_scale_per_token_head)
+        # Scalars: k strides then v strides
+        if self._use_k_scale_per_token_head:
+            additional_args.extend(
+                [
+                    k_scale_per_token_head.size(1) * k_scale_per_token_head.size(2)
+                    if k_scale_per_token_head is not None
+                    else 0,
+                    k_scale_per_token_head.size(2)
+                    if k_scale_per_token_head is not None
+                    else 0,
+                ]
+            )
+        if self._use_v_scale_per_token_head:
+            additional_args.extend(
+                [
+                    v_scale_per_token_head.size(1) * v_scale_per_token_head.size(2)
+                    if v_scale_per_token_head is not None
+                    else 0,
+                    v_scale_per_token_head.size(2)
+                    if v_scale_per_token_head is not None
+                    else 0,
+                ]
+            )
+
         self.module.run(
             self.float_workspace_buffer,
             self.int_workspace_buffer,
@@ -195,6 +238,7 @@ class BatchAttention:
             sm_scale,
             logits_soft_cap,
             # ADDITIONAL_FUNC_PARAMS
+            *additional_args,
             # PROFILER_FUNC_PARAMS
             *profiler_args,
         )

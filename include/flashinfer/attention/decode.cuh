@@ -30,6 +30,7 @@
 #include "../vec_dtypes.cuh"
 #include "cascade.cuh"
 #include "state.cuh"
+#include "variant_helper.cuh"
 
 namespace flashinfer {
 
@@ -77,6 +78,16 @@ __device__ __forceinline__ void compute_qk(
     } else {
       // do not apply rotary embedding
       k_vec.cast_load(smem + (j * bdx + tx) * vec_size);
+    }
+    if constexpr (has_k_scale_per_token_head_v<Params>) {
+      uint32_t abs_kv_idx = kv_idx_base + tz * tile_size + j;
+      float k_scale_val =
+          params.k_scale_per_token_head[batch_idx * params.k_scale_per_token_head_stride_batch +
+                                        abs_kv_idx * params.k_scale_per_token_head_stride_seq +
+                                        kv_head_idx];
+      for (uint32_t vi = 0; vi < vec_size; ++vi) {
+        k_vec[vi] *= k_scale_val;
+      }
     }
     s[j] = 0.f;
 #pragma unroll
@@ -128,14 +139,28 @@ __device__ __forceinline__ void compute_qk(
  * \param compute_stage_idx A integer indicates the compute stage index in the pipeline
  * \param st The flashattention state to be updated
  */
-template <uint32_t vec_size, uint32_t bdx, uint32_t tile_size, typename T>
-__device__ __forceinline__ void update_local_state(const T* smem, const float* s,
+template <uint32_t vec_size, uint32_t bdx, uint32_t tile_size, typename T, typename Params>
+__device__ __forceinline__ void update_local_state(const Params& params, uint32_t batch_idx,
+                                                   uint32_t kv_head_idx, uint32_t kv_idx_base,
+                                                   const T* smem, const float* s,
                                                    uint32_t compute_stage_idx,
                                                    state_t<vec_size>& st, uint32_t tx) {
 #pragma unroll
   for (uint32_t j = 0; j < tile_size; ++j) {
     vec_t<float, vec_size> v_vec;
     v_vec.cast_load(smem + (j * bdx + tx) * vec_size);
+    // Apply per-token-head V scale to current token's v_vec before accumulation
+    // (late scaling in float32 for precision)
+    if constexpr (has_v_scale_per_token_head_v<Params>) {
+      uint32_t abs_kv_idx = kv_idx_base + j;
+      float v_scale_val =
+          params.v_scale_per_token_head[batch_idx * params.v_scale_per_token_head_stride_batch +
+                                        abs_kv_idx * params.v_scale_per_token_head_stride_seq +
+                                        kv_head_idx];
+      for (uint32_t i = 0; i < vec_size; ++i) {
+        v_vec[i] *= v_scale_val;
+      }
+    }
 #pragma unroll
     for (uint32_t i = 0; i < vec_size; ++i) {
       st.o[i] = st.o[i] + s[j] * v_vec[i];
@@ -330,6 +355,7 @@ __global__ void SingleDecodeWithKVCacheKernel(const __grid_constant__ Params par
     cp_async::wait_group<2 * num_stages_smem - 1>();
     block.sync();
     update_local_state<vec_size, bdx, bdy * tile_size_per_bdx>(
+        params, /*batch_idx=*/0, kv_head_idx, consumer_kv_idx_base,
         v_smem + (stage_idx * bdz + tz) * bdy * tile_size_per_bdx * head_dim, s, stage_idx,
         st_local, tx);
     block.sync();
@@ -568,6 +594,7 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& param
     cp_async::wait_group<2 * num_stages_smem - 1>();
     block.sync();
     update_local_state<vec_size, bdx, bdy * tile_size_per_bdx>(
+        params, batch_idx, kv_head_idx, chunk_start + iter * tile_size_per_bdx * bdy * bdz,
         v_smem + (stage_idx * bdz + tz) * bdy * tile_size_per_bdx * head_dim, s, stage_idx, st, tx);
     block.sync();
 

@@ -73,6 +73,8 @@ def get_batch_decode_uri(
     pos_encoding_mode: int,
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
+    use_k_scale_per_token_head: bool = False,
+    use_v_scale_per_token_head: bool = False,
 ) -> str:
     return (
         f"batch_decode_with_kv_cache_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
@@ -84,6 +86,8 @@ def get_batch_decode_uri(
         f"posenc_{pos_encoding_mode}_"
         f"use_swa_{use_sliding_window}_"
         f"use_logits_cap_{use_logits_soft_cap}"
+        + ("_k_pth" if use_k_scale_per_token_head else "")
+        + ("_v_pth" if use_v_scale_per_token_head else "")
     )
 
 
@@ -325,6 +329,8 @@ def get_single_prefill_uri(
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
     use_fp16_qk_reduction: bool,
+    use_k_scale_per_token_head: bool = False,
+    use_v_scale_per_token_head: bool = False,
 ) -> str:
     return (
         f"single_prefill_with_kv_cache_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
@@ -335,7 +341,10 @@ def get_single_prefill_uri(
         f"posenc_{pos_encoding_mode}_"
         f"use_swa_{use_sliding_window}_"
         f"use_logits_cap_{use_logits_soft_cap}_"
-        f"f16qk_{use_fp16_qk_reduction}" + ("_sm90" if backend == "fa3" else "")
+        f"f16qk_{use_fp16_qk_reduction}"
+        + ("_sm90" if backend == "fa3" else "")
+        + ("_k_pth" if use_k_scale_per_token_head else "")
+        + ("_v_pth" if use_v_scale_per_token_head else "")
     )
 
 
@@ -381,6 +390,8 @@ def get_batch_prefill_uri(
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
     use_fp16_qk_reduction: bool,
+    use_k_scale_per_token_head: bool = False,
+    use_v_scale_per_token_head: bool = False,
 ) -> str:
     return (
         f"batch_prefill_with_kv_cache_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
@@ -392,7 +403,10 @@ def get_batch_prefill_uri(
         f"posenc_{pos_encoding_mode}_"
         f"use_swa_{use_sliding_window}_"
         f"use_logits_cap_{use_logits_soft_cap}_"
-        f"f16qk_{use_fp16_qk_reduction}" + ("_sm90" if backend == "fa3" else "")
+        f"f16qk_{use_fp16_qk_reduction}"
+        + ("_sm90" if backend == "fa3" else "")
+        + ("_k_pth" if use_k_scale_per_token_head else "")
+        + ("_v_pth" if use_v_scale_per_token_head else "")
     )
 
 
@@ -428,6 +442,8 @@ def get_batch_attention_uri(
     pos_encoding_mode: int,
     use_logits_soft_cap: bool,
     use_profiler: bool,
+    use_k_scale_per_token_head: bool = False,
+    use_v_scale_per_token_head: bool = False,
 ) -> str:
     return (
         f"batch_attention_with_kv_cache_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
@@ -439,6 +455,8 @@ def get_batch_attention_uri(
         f"posenc_{pos_encoding_mode}_"
         f"use_logits_soft_cap_{str(use_logits_soft_cap).lower()}_"
         f"use_profiler_{str(use_profiler).lower()}"
+        + ("_k_pth" if use_k_scale_per_token_head else "")
+        + ("_v_pth" if use_v_scale_per_token_head else "")
     )
 
 
@@ -497,6 +515,8 @@ def gen_single_prefill_module(
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
     use_fp16_qk_reduction: bool,
+    use_k_scale_per_token_head: bool = False,
+    use_v_scale_per_token_head: bool = False,
 ) -> JitSpec:
     uri = get_single_prefill_uri(
         backend,
@@ -509,6 +529,8 @@ def gen_single_prefill_module(
         use_sliding_window,
         use_logits_soft_cap,
         use_fp16_qk_reduction,
+        use_k_scale_per_token_head,
+        use_v_scale_per_token_head,
     )
 
     # use `fp8_enabled` flag to use separate kernel template
@@ -527,6 +549,26 @@ def gen_single_prefill_module(
             "rope_rcp_theta",
         ]
         additional_scalar_dtypes = ["double", "double", "double", "double"]
+        if use_k_scale_per_token_head:
+            additional_tensor_names.append("k_scale_per_token_head")
+            additional_tensor_dtypes.append("float")
+            additional_scalar_names.extend(
+                [
+                    "k_scale_per_token_head_stride_batch",
+                    "k_scale_per_token_head_stride_seq",
+                ]
+            )
+            additional_scalar_dtypes.extend(["int64_t", "int64_t"])
+        if use_v_scale_per_token_head:
+            additional_tensor_names.append("v_scale_per_token_head")
+            additional_tensor_dtypes.append("float")
+            additional_scalar_names.extend(
+                [
+                    "v_scale_per_token_head_stride_batch",
+                    "v_scale_per_token_head_stride_seq",
+                ]
+            )
+            additional_scalar_dtypes.extend(["int64_t", "int64_t"])
         variant_name = f"DefaultAttention<use_custom_mask, {str(use_sliding_window).lower()}, {str(use_logits_soft_cap).lower()}, {str(pos_encoding_mode == 2).lower()}>"
         variant_decl = "#include<flashinfer/attention/variants.cuh>"
     else:
@@ -916,6 +958,8 @@ def gen_batch_decode_module(
     pos_encoding_mode: int,
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
+    use_k_scale_per_token_head: bool = False,
+    use_v_scale_per_token_head: bool = False,
 ) -> JitSpec:
     uri = get_batch_decode_uri(
         dtype_q,
@@ -927,7 +971,34 @@ def gen_batch_decode_module(
         pos_encoding_mode,
         use_sliding_window,
         use_logits_soft_cap,
+        use_k_scale_per_token_head,
+        use_v_scale_per_token_head,
     )
+    additional_tensor_names = ["maybe_alibi_slopes"]
+    additional_tensor_dtypes = ["float"]
+    additional_scalar_names = [
+        "logits_soft_cap",
+        "sm_scale",
+        "rope_rcp_scale",
+        "rope_rcp_theta",
+    ]
+    additional_scalar_dtypes = ["double", "double", "double", "double"]
+    if use_k_scale_per_token_head:
+        additional_tensor_names.append("k_scale_per_token_head")
+        additional_tensor_dtypes.append("float")
+        additional_scalar_names += [
+            "k_scale_per_token_head_stride_batch",
+            "k_scale_per_token_head_stride_seq",
+        ]
+        additional_scalar_dtypes += ["int64_t", "int64_t"]
+    if use_v_scale_per_token_head:
+        additional_tensor_names.append("v_scale_per_token_head")
+        additional_tensor_dtypes.append("float")
+        additional_scalar_names += [
+            "v_scale_per_token_head_stride_batch",
+            "v_scale_per_token_head_stride_seq",
+        ]
+        additional_scalar_dtypes += ["int64_t", "int64_t"]
     return gen_customize_batch_decode_module(
         uri,
         dtype_q,
@@ -936,15 +1007,10 @@ def gen_batch_decode_module(
         dtype_idx,
         head_dim_qk,
         head_dim_vo,
-        ["maybe_alibi_slopes"],  # additional_tensor_names
-        ["float"],  # additional_tensor_dtypes
-        [
-            "logits_soft_cap",
-            "sm_scale",
-            "rope_rcp_scale",
-            "rope_rcp_theta",
-        ],  # additional_scalar_names
-        ["double", "double", "double", "double"],  # additional_scalar_dtypes
+        additional_tensor_names,
+        additional_tensor_dtypes,
+        additional_scalar_names,
+        additional_scalar_dtypes,
         f"DefaultAttention<false, {str(use_sliding_window).lower()}, {str(use_logits_soft_cap).lower()}, {str(pos_encoding_mode == 2).lower()}>",  # variant_name
         "#include<flashinfer/attention/variants.cuh>",  # variant_decl
         pos_encoding_mode=pos_encoding_mode,
@@ -965,6 +1031,8 @@ def gen_batch_prefill_module(
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
     use_fp16_qk_reduction: bool,
+    use_k_scale_per_token_head: bool = False,
+    use_v_scale_per_token_head: bool = False,
 ) -> JitSpec:
     uri = get_batch_prefill_uri(
         backend,
@@ -978,6 +1046,8 @@ def gen_batch_prefill_module(
         use_sliding_window,
         use_logits_soft_cap,
         use_fp16_qk_reduction,
+        use_k_scale_per_token_head,
+        use_v_scale_per_token_head,
     )
 
     # use `fp8_enabled` flag to use separate kernel template
@@ -1018,6 +1088,26 @@ def gen_batch_prefill_module(
             "token_pos_in_items_len",
         ]
         additional_scalar_dtypes = ["double", "double", "double", "double", "int64_t"]
+        if use_k_scale_per_token_head:
+            additional_tensor_names.append("k_scale_per_token_head")
+            additional_tensor_dtypes.append("float")
+            additional_scalar_names.extend(
+                [
+                    "k_scale_per_token_head_stride_batch",
+                    "k_scale_per_token_head_stride_seq",
+                ]
+            )
+            additional_scalar_dtypes.extend(["int64_t", "int64_t"])
+        if use_v_scale_per_token_head:
+            additional_tensor_names.append("v_scale_per_token_head")
+            additional_tensor_dtypes.append("float")
+            additional_scalar_names.extend(
+                [
+                    "v_scale_per_token_head_stride_batch",
+                    "v_scale_per_token_head_stride_seq",
+                ]
+            )
+            additional_scalar_dtypes.extend(["int64_t", "int64_t"])
         variant_name = f"DefaultAttention<use_custom_mask, {str(use_sliding_window).lower()}, {str(use_logits_soft_cap).lower()}, {str(pos_encoding_mode == 2).lower()}>"
         variant_decl = "#include<flashinfer/attention/variants.cuh>"
     else:
@@ -1136,6 +1226,8 @@ def gen_batch_attention_module(
     pos_encoding_mode: int,
     use_logits_soft_cap: bool,
     use_profiler: bool,
+    use_k_scale_per_token_head: bool = False,
+    use_v_scale_per_token_head: bool = False,
 ):
     uri = get_batch_attention_uri(
         dtype_q,
@@ -1147,12 +1239,36 @@ def gen_batch_attention_module(
         pos_encoding_mode,
         use_logits_soft_cap,
         use_profiler,
+        use_k_scale_per_token_head,
+        use_v_scale_per_token_head,
     )
 
     additional_tensor_names: List[str] = []
     additional_tensor_dtypes: List[str] = []
     additional_scalar_names: List[str] = []
     additional_scalar_dtypes: List[str] = []
+
+    if use_k_scale_per_token_head:
+        additional_tensor_names.append("k_scale_per_token_head")
+        additional_tensor_dtypes.append("float")
+        additional_scalar_names.extend(
+            [
+                "k_scale_per_token_head_stride_batch",
+                "k_scale_per_token_head_stride_seq",
+            ]
+        )
+        additional_scalar_dtypes.extend(["int64_t", "int64_t"])
+    if use_v_scale_per_token_head:
+        additional_tensor_names.append("v_scale_per_token_head")
+        additional_tensor_dtypes.append("float")
+        additional_scalar_names.extend(
+            [
+                "v_scale_per_token_head_stride_batch",
+                "v_scale_per_token_head_stride_seq",
+            ]
+        )
+        additional_scalar_dtypes.extend(["int64_t", "int64_t"])
+
     variant_name = f"StandardAttention<{str(use_logits_soft_cap).lower()}>"
     variant_decl = "#include<flashinfer/attention/variants.cuh>"
 

@@ -254,6 +254,20 @@ def gen_attention(
             use_logits_soft_cap=use_logits_soft_cap,
             use_profiler=False,
         )
+        if dtype_kv in f8_dtype_:
+            yield gen_batch_attention_module(
+                dtype_q=dtype_qo,
+                dtype_kv=dtype_kv,
+                dtype_o=dtype_qo,
+                dtype_idx=torch.int32,
+                head_dim_qk=head_dim_qk,
+                head_dim_vo=head_dim_vo,
+                pos_encoding_mode=0,
+                use_logits_soft_cap=use_logits_soft_cap,
+                use_profiler=False,
+                use_k_scale_per_token_head=True,
+                use_v_scale_per_token_head=True,
+            )
 
     # FA3 MHA / MQA / GQA
     if has_sm90:

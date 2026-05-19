@@ -271,16 +271,16 @@ struct BlockBatchPagedAttentionPersistent {
                   kv_head_idx, len_kv_chunk] = get_block_coord(params, work_idx);
 
       const uint32_t kv_chunk_idx = kv_start / len_kv_chunk;
-      const uint32_t num_kv_chunks = ceil_div(
-          CAUSAL
-              ? min((kv_len - q_len) + ceil_div(packed_qo_start + cluster_tile_q, gqa_group_size),
-                    kv_len)
-              : kv_len,
-          len_kv_chunk);
+      const uint32_t num_kv_chunks =
+          ceil_div(CAUSAL ? min(static_cast<uint32_t>(kv_len - q_len) +
+                                    ceil_div(packed_qo_start + cluster_tile_q, gqa_group_size),
+                                static_cast<uint32_t>(kv_len))
+                          : kv_len,
+                   len_kv_chunk);
       const uint32_t qo_packed_idx_base = packed_qo_start + blockIdx.x * CTA_TILE_Q +
                                           get_warp_idx_q<KTraits>(tid.y) * NUM_MMA_Q * 16;
-      const uint32_t qo_upperbound =
-          min(q_len, ceil_div(qo_packed_idx_base + CTA_TILE_Q, gqa_group_size));
+      const uint32_t qo_upperbound = min(static_cast<uint32_t>(q_len),
+                                         ceil_div(qo_packed_idx_base + CTA_TILE_Q, gqa_group_size));
 
       init_states<KTraits>(variant, o_frag, m, d);
 
@@ -292,15 +292,17 @@ struct BlockBatchPagedAttentionPersistent {
 
       smem_t<SWIZZLE_MODE_KV> k_smem(smem_storage->k_smem), v_smem(smem_storage->v_smem);
       int kv_tile_idx =
-          ceil_div((CAUSAL ? min(kv_end,
-                                 kv_len - q_len +
+          ceil_div((CAUSAL ? min(static_cast<uint32_t>(kv_end),
+                                 static_cast<uint32_t>(kv_len) - static_cast<uint32_t>(q_len) +
                                      ceil_div((packed_qo_start + cluster_tile_q), gqa_group_size))
-                           : kv_end),
+                           : static_cast<uint32_t>(kv_end)),
                    CTA_TILE_KV) -
           1 - (kv_start / CTA_TILE_KV);
 
       int mask_tile_idx =
-          (CAUSAL ? min(kv_end, kv_len - q_len + ceil_div(packed_qo_start, gqa_group_size))
+          (CAUSAL ? min(static_cast<uint32_t>(kv_end),
+                        static_cast<uint32_t>(kv_len) - static_cast<uint32_t>(q_len) +
+                            ceil_div(packed_qo_start, gqa_group_size))
                   : kv_end) /
               CTA_TILE_KV -
           (kv_start / CTA_TILE_KV);
@@ -332,7 +334,9 @@ struct BlockBatchPagedAttentionPersistent {
             cp_async::wait_group<1>();
             __syncthreads();
 
-            compute_qk<KTraits>(&q_smem, &q_smem_offset_r, &k_smem, &k_smem_offset_r, s_frag);
+            compute_qk<KTraits, Params>(params, kv_head_idx, kv_start + kv_tile_idx * CTA_TILE_KV,
+                                        /*request_idx=*/work_idx, lane_idx, &q_smem,
+                                        &q_smem_offset_r, &k_smem, &k_smem_offset_r, s_frag);
             if constexpr (AttentionVariant::use_logits_soft_cap) {
               logits_transform<KTraits>(
                   params, variant, /*batch_idx=*/0, qo_packed_idx_base,
@@ -357,7 +361,9 @@ struct BlockBatchPagedAttentionPersistent {
             cp_async::wait_group<1>();
 
             __syncthreads();
-            compute_sfm_v<KTraits>(&v_smem, &v_smem_offset_r, s_frag, o_frag, d);
+            compute_sfm_v<KTraits, Params>(
+                params, kv_head_idx, kv_start + (kv_tile_idx - 1) * CTA_TILE_KV,
+                /*request_idx=*/work_idx, lane_idx, &v_smem, &v_smem_offset_r, s_frag, o_frag, d);
             __syncthreads();
 
             page_produce_kv<true, KTraits>(smem_storage, &v_smem_offset_w, v,
@@ -370,7 +376,9 @@ struct BlockBatchPagedAttentionPersistent {
 
 #pragma unroll
       for (; kv_tile_idx >= 0; --kv_tile_idx) {
-        compute_qk<KTraits>(&q_smem, &q_smem_offset_r, &k_smem, &k_smem_offset_r, s_frag);
+        compute_qk<KTraits, Params>(params, kv_head_idx, kv_start + kv_tile_idx * CTA_TILE_KV,
+                                    /*request_idx=*/work_idx, lane_idx, &q_smem, &q_smem_offset_r,
+                                    &k_smem, &k_smem_offset_r, s_frag);
         if constexpr (AttentionVariant::use_logits_soft_cap) {
           logits_transform<KTraits>(
               params, variant, /*batch_idx=*/0, qo_packed_idx_base,
@@ -384,7 +392,9 @@ struct BlockBatchPagedAttentionPersistent {
                 (kv_tile_idx * NUM_WARPS_KV + get_warp_idx_kv<KTraits>(tid.z)) * NUM_MMA_KV * 16,
             q_len, kv_len, kv_end, gqa_group_size, s_frag, tid, kv_head_idx);
         update_mdo_states<KTraits>(variant, s_frag, o_frag, m, d);
-        compute_sfm_v<KTraits>(&v_smem, &v_smem_offset_r, s_frag, o_frag, d);
+        compute_sfm_v<KTraits, Params>(params, kv_head_idx, kv_start + kv_tile_idx * CTA_TILE_KV,
+                                       /*request_idx=*/work_idx, lane_idx, &v_smem,
+                                       &v_smem_offset_r, s_frag, o_frag, d);
       }
 
       __syncthreads();

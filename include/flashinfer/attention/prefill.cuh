@@ -611,9 +611,10 @@ __device__ __forceinline__ void k_smem_inplace_apply_rotary(
   }
 }
 
-template <typename KTraits>
+template <typename KTraits, typename Params>
 __device__ __forceinline__ void compute_qk(
-    smem_t<KTraits::SWIZZLE_MODE_Q>* q_smem, uint32_t* q_smem_offset_r,
+    const Params& params, uint32_t kv_head_idx, uint32_t kv_idx_base, uint32_t request_idx,
+    uint32_t lane_idx, smem_t<KTraits::SWIZZLE_MODE_Q>* q_smem, uint32_t* q_smem_offset_r,
     smem_t<KTraits::SWIZZLE_MODE_KV>* k_smem, uint32_t* k_smem_offset_r,
     typename KTraits::DTypeQKAccum (*s_frag)[KTraits::NUM_MMA_KV][8]) {
   constexpr uint32_t UPCAST_STRIDE_Q = KTraits::UPCAST_STRIDE_Q;
@@ -645,6 +646,33 @@ __device__ __forceinline__ void compute_qk(
         b_frag_f8[1] = frag_layout_swizzle_16b_to_8b(b_frag_f8[1]);
         vec_cast<typename KTraits::DTypeQ, typename KTraits::DTypeKV>::cast<8>(
             (typename KTraits::DTypeQ*)b_frag, (typename KTraits::DTypeKV*)b_frag_f8);
+        if constexpr (has_k_scale_per_token_head_v<Params>) {
+          // Preload all 16 scales for this 16-token tile.
+          // Each b_frag[reg_id] element corresponds to a DIFFERENT token
+          // position within the tile (see logits_transform line 730-732).
+          float tile_scales[16];
+#pragma unroll
+          for (uint32_t si = 0; si < 16; ++si) {
+            uint32_t tok = kv_idx_base + mma_kv * 16 + si;
+            tile_scales[si] =
+                params.k_scale_per_token_head[request_idx *
+                                                  params.k_scale_per_token_head_stride_batch +
+                                              tok * params.k_scale_per_token_head_stride_seq +
+                                              kv_head_idx];
+          }
+          // Apply per-element scale to all 8 b_frag elements.
+          // After vec_cast, all 8 elements (left + right half) are valid.
+          // Token offset mapping from logits_transform:
+          //   offset = 2*(lane%4) + 8*(reg_id/4) + reg_id%2
+          float all_f32[8];
+#pragma unroll
+          for (int ei = 0; ei < 8; ++ei) {
+            uint32_t tok_offset = 2 * (lane_idx % 4) + 8 * (ei / 4) + ei % 2;
+            all_f32[ei] = float(((typename KTraits::DTypeQ*)b_frag)[ei]) * tile_scales[tok_offset];
+          }
+          vec_cast<typename KTraits::DTypeQ, float>::cast<8>((typename KTraits::DTypeQ*)b_frag,
+                                                             all_f32);
+        }
       } else {
         k_smem->ldmatrix_m8n8x4(*k_smem_offset_r, b_frag);
       }
@@ -952,9 +980,10 @@ __device__ __forceinline__ void update_mdo_states(
   }
 }
 
-template <typename KTraits>
+template <typename KTraits, typename Params>
 __device__ __forceinline__ void compute_sfm_v(
-    smem_t<KTraits::SWIZZLE_MODE_KV>* v_smem, uint32_t* v_smem_offset_r,
+    const Params& params, uint32_t kv_head_idx, uint32_t kv_idx_base, uint32_t request_idx,
+    uint32_t lane_idx, smem_t<KTraits::SWIZZLE_MODE_KV>* v_smem, uint32_t* v_smem_offset_r,
     typename KTraits::DTypeQKAccum (*s_frag)[KTraits::NUM_MMA_KV][8],
     float (*o_frag)[KTraits::NUM_MMA_D_VO][8], float (*d)[2]) {
   constexpr uint32_t UPCAST_STRIDE_V = KTraits::UPCAST_STRIDE_V;
@@ -987,6 +1016,21 @@ __device__ __forceinline__ void compute_sfm_v(
 
 #pragma unroll
   for (uint32_t mma_kv = 0; mma_kv < KTraits::NUM_MMA_KV; ++mma_kv) {
+    // Preload all 16 V scales for this 16-token tile.
+    // Each b_frag[reg_id] element corresponds to a DIFFERENT token
+    // position within the tile (same mapping as logits_transform).
+    float v_tile_scales[16];
+    if constexpr (has_v_scale_per_token_head_v<Params>) {
+#pragma unroll
+      for (uint32_t si = 0; si < 16; ++si) {
+        uint32_t tok = kv_idx_base + mma_kv * 16 + si;
+        v_tile_scales[si] =
+            params.v_scale_per_token_head[request_idx * params.v_scale_per_token_head_stride_batch +
+                                          tok * params.v_scale_per_token_head_stride_seq +
+                                          kv_head_idx];
+      }
+    }
+
 #pragma unroll
     for (uint32_t mma_d = 0; mma_d < KTraits::NUM_MMA_D_VO; ++mma_d) {
       uint32_t b_frag[4];
@@ -1002,6 +1046,30 @@ __device__ __forceinline__ void compute_sfm_v(
         vec_cast<typename KTraits::DTypeQ, typename KTraits::DTypeKV>::cast<8>(
             (typename KTraits::DTypeQ*)b_frag, (typename KTraits::DTypeKV*)b_frag_f8);
         swap(b_frag[1], b_frag[2]);
+        // Apply per-element V scale to all 8 b_frag elements.
+        // After vec_cast + swap, all 8 elements are valid.
+        // The swap(b_frag[1], b_frag[2]) inverts tok_offset at positions 1,2
+        // for the left half. Right half tok_offset unchanged.
+        if constexpr (has_v_scale_per_token_head_v<Params>) {
+          float all_f32[8];
+#pragma unroll
+          for (int ei = 0; ei < 8; ++ei) {
+            uint32_t half = ei / 4, local = ei % 4;
+            uint32_t base_offset = 2 * (lane_idx % 4) + 8 * half;
+            uint32_t local_offset;
+            if (half == 0) {
+              // Left half: swap inverts tok_offset at positions 1,2
+              local_offset = 2 * ((local + 1) % 2) + (local / 2) % 2;
+            } else {
+              // Right half: no swap effect on tok_offset
+              local_offset = 2 * (local % 2) + local / 2;
+            }
+            all_f32[ei] = float(((typename KTraits::DTypeQ*)b_frag)[ei]) *
+                          v_tile_scales[base_offset + local_offset];
+          }
+          vec_cast<typename KTraits::DTypeQ, float>::cast<8>((typename KTraits::DTypeQ*)b_frag,
+                                                             all_f32);
+        }
       } else {
         v_smem->ldmatrix_m8n8x4_trans(*v_smem_offset_r, b_frag);
       }
@@ -1495,9 +1563,11 @@ __device__ __forceinline__ void SinglePrefillWithKVCacheDevice(
       }
 
       // compute attention score
-      compute_qk<KTraits>(&qo_smem, &q_smem_offset_r, &k_smem, &k_smem_offset_r, s_frag);
       uint32_t kv_idx_base =
           chunk_start + (iter * NUM_WARPS_KV + get_warp_idx_kv<KTraits>(tid.z)) * NUM_MMA_KV * 16;
+      compute_qk<KTraits, Params>(params, kv_head_idx, kv_idx_base, /*request_idx=*/0,
+                                  /*lane_idx=*/tid.x, &qo_smem, &q_smem_offset_r, &k_smem,
+                                  &k_smem_offset_r, s_frag);
       logits_transform<KTraits>(params, variant, /*batch_idx=*/0, qo_packed_idx_base, kv_idx_base,
                                 qo_len, kv_len, group_size, s_frag, tid, kv_head_idx);
 
@@ -1518,7 +1588,9 @@ __device__ __forceinline__ void SinglePrefillWithKVCacheDevice(
       block.sync();
 
       // compute sfm*v
-      compute_sfm_v<KTraits>(&v_smem, &v_smem_offset_r, s_frag, o_frag, d);
+      compute_sfm_v<KTraits, Params>(params, kv_head_idx, kv_idx_base, /*request_idx=*/0,
+                                     /*lane_idx=*/tid.x, &v_smem, &v_smem_offset_r, s_frag, o_frag,
+                                     d);
 
       block.sync();
       produce_kv<true, SharedMemFillMode::kFillZero, KTraits>(
@@ -1934,9 +2006,10 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
       }
 
       // compute attention score
-      compute_qk<KTraits>(&qo_smem, &q_smem_offset_r, &k_smem, &k_smem_offset_r, s_frag);
       uint32_t kv_idx_base =
           chunk_start + (iter * NUM_WARPS_KV + get_warp_idx_kv<KTraits>(tid.z)) * NUM_MMA_KV * 16;
+      compute_qk<KTraits, Params>(params, kv_head_idx, kv_idx_base, request_idx, /*lane_idx=*/tid.x,
+                                  &qo_smem, &q_smem_offset_r, &k_smem, &k_smem_offset_r, s_frag);
       logits_transform<KTraits>(params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base,
                                 kv_idx_base, qo_len, kv_len, group_size, s_frag, tid, kv_head_idx);
 
@@ -1958,7 +2031,9 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
       block.sync();
 
       // compute sfm*v
-      compute_sfm_v<KTraits>(&v_smem, &v_smem_offset_r, s_frag, o_frag, d);
+      compute_sfm_v<KTraits, Params>(params, kv_head_idx, kv_idx_base, request_idx,
+                                     /*lane_idx=*/tid.x, &v_smem, &v_smem_offset_r, s_frag, o_frag,
+                                     d);
 
       block.sync();
       produce_kv<true, SharedMemFillMode::kFillZero, KTraits>(
@@ -2297,9 +2372,10 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
       }
 
       // compute attention score
-      compute_qk<KTraits>(&qo_smem, &q_smem_offset_r, &k_smem, &k_smem_offset_r, s_frag);
       uint32_t kv_idx_base =
           chunk_start + (iter * NUM_WARPS_KV + get_warp_idx_kv<KTraits>(tid.z)) * NUM_MMA_KV * 16;
+      compute_qk<KTraits, Params>(params, kv_head_idx, kv_idx_base, request_idx, /*lane_idx=*/tid.x,
+                                  &qo_smem, &q_smem_offset_r, &k_smem, &k_smem_offset_r, s_frag);
       logits_transform<KTraits>(params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base,
                                 kv_idx_base, qo_len, kv_len, group_size, s_frag, tid, kv_head_idx);
 
@@ -2345,7 +2421,9 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
       block.sync();
 
       // compute sfm*v
-      compute_sfm_v<KTraits>(&v_smem, &v_smem_offset_r, s_frag, o_frag, d);
+      compute_sfm_v<KTraits, Params>(params, kv_head_idx, kv_idx_base, request_idx,
+                                     /*lane_idx=*/tid.x, &v_smem, &v_smem_offset_r, s_frag, o_frag,
+                                     d);
 
       block.sync();
       page_produce_kv<true, KTraits>(&smem_storage, &v_smem_offset_w, paged_kv.v_data,

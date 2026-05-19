@@ -220,6 +220,13 @@ def get_batch_decode_jit_module(module_name: str, jit_module: Any):
 
 @functools.cache
 def get_batch_decode_module(*args):
+    # Extract per-token-head flags for conditional param passing
+    # args = (dtype_q, dtype_kv, dtype_o, dtype_idx, head_dim_qk, head_dim_vo,
+    #         pos_encoding_mode, use_sliding_window, use_logits_soft_cap,
+    #         use_k_scale_per_token_head, use_v_scale_per_token_head)
+    _use_k_scale_per_token_head = len(args) > 9 and args[9]
+    _use_v_scale_per_token_head = len(args) > 10 and args[10]
+
     uri = get_batch_decode_uri(*args)
     mod = gen_batch_decode_module(*args).build_and_load()
     plan_func = mod.plan
@@ -258,8 +265,13 @@ def get_batch_decode_module(*args):
         sm_scale: float,
         rope_scale: float,
         rope_theta: float,
+        k_scale_per_token_head: Optional[torch.Tensor] = None,
+        v_scale_per_token_head: Optional[torch.Tensor] = None,
     ) -> None:
-        run_func(
+        # Build args for run_func — order must match ADDITIONAL_FUNC_PARAMS:
+        # all tensors first (base + per-token-head), then all scalars
+        # Per-token-head params only appended when module compiled with support
+        run_args = [
             float_workspace_buffer,
             int_workspace_buffer,
             plan_info_vec,
@@ -275,11 +287,43 @@ def get_batch_decode_module(*args):
             window_left,
             enable_pdl,
             alibi_slopes,
-            logits_soft_cap,
-            sm_scale,
-            1.0 / rope_scale,  # rope_rcp_scale
-            1.0 / rope_theta,  # rope_rcp_theta
+        ]
+        # Per-token-head tensors (before base scalars)
+        if _use_k_scale_per_token_head:
+            run_args.append(k_scale_per_token_head)
+        if _use_v_scale_per_token_head:
+            run_args.append(v_scale_per_token_head)
+        # Base scalars
+        run_args.extend(
+            [
+                logits_soft_cap,
+                sm_scale,
+                1.0 / rope_scale,  # rope_rcp_scale
+                1.0 / rope_theta,  # rope_rcp_theta
+            ]
         )
+        # Per-token-head strides (after base scalars)
+        if _use_k_scale_per_token_head:
+            if k_scale_per_token_head is not None:
+                run_args.extend(
+                    [
+                        k_scale_per_token_head.size(1) * k_scale_per_token_head.size(2),
+                        k_scale_per_token_head.size(2),
+                    ]
+                )
+            else:
+                run_args.extend([0, 0])
+        if _use_v_scale_per_token_head:
+            if v_scale_per_token_head is not None:
+                run_args.extend(
+                    [
+                        v_scale_per_token_head.size(1) * v_scale_per_token_head.size(2),
+                        v_scale_per_token_head.size(2),
+                    ]
+                )
+            else:
+                run_args.extend([0, 0])
+        run_func(*run_args)
 
     @register_fake_op(f"flashinfer::{uri}_run")
     def _fake_run_batch_decode(
@@ -302,6 +346,8 @@ def get_batch_decode_module(*args):
         sm_scale: float,
         rope_scale: float,
         rope_theta: float,
+        k_scale_per_token_head: Optional[torch.Tensor] = None,
+        v_scale_per_token_head: Optional[torch.Tensor] = None,
     ) -> None:
         pass
 
@@ -855,6 +901,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
         seq_lens: Optional[torch.Tensor] = None,
         fixed_split_size: Optional[int] = None,
         disable_split_kv: bool = False,
+        use_k_scale_per_token_head: bool = False,
+        use_v_scale_per_token_head: bool = False,
     ) -> None:
         r"""Plan batch decode for given problem specification.
 
@@ -913,6 +961,12 @@ class BatchDecodeWithPagedKVCacheWrapper:
             and lead to a varied number of launched CTAs.
         disable_split_kv : bool,
             Whether to disable the split-kv for determinism in CUDA Graph, defaults to ``False``.
+        use_k_scale_per_token_head : bool
+            Whether to enable FP8 per-token-head K scale support. When enabled,
+            ``k_scale_per_token_head`` must be provided in :meth:`run`. Defaults to ``False``.
+        use_v_scale_per_token_head : bool
+            Whether to enable FP8 per-token-head V scale support. When enabled,
+            ``v_scale_per_token_head`` must be provided in :meth:`run`. Defaults to ``False``.
         Note
         ----
         The :meth:`plan` method should be called before any :meth:`run` or
@@ -1081,6 +1135,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     window_left != -1,  # use_sliding_window
                     logits_soft_cap > 0,  # use_logits_soft_cap
                     False,  # use_fp16_qk_reduction
+                    use_k_scale_per_token_head,
+                    use_v_scale_per_token_head,
                 )
 
             args = [
@@ -1122,6 +1178,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     PosEncodingMode[pos_encoding_mode].value,
                     window_left != -1,  # use_sliding_window
                     logits_soft_cap > 0,  # use_logits_soft_cap
+                    use_k_scale_per_token_head,
+                    use_v_scale_per_token_head,
                 )
             self._plan_info = self._cached_module.plan(
                 self._float_workspace_buffer,
@@ -1147,6 +1205,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
         self._sm_scale = sm_scale
         self._rope_scale = rope_scale
         self._rope_theta = rope_theta
+        self._use_k_scale_per_token_head = use_k_scale_per_token_head
+        self._use_v_scale_per_token_head = use_v_scale_per_token_head
 
     begin_forward = plan
 
@@ -1193,6 +1253,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
         q_len_per_req: Optional[int] = 1,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
         kv_cache_sf: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        k_scale_per_token_head: Optional[torch.Tensor] = None,
+        v_scale_per_token_head: Optional[torch.Tensor] = None,
     ) -> torch.Tensor: ...
 
     @overload
@@ -1213,6 +1275,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
         q_len_per_req: Optional[int] = 1,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
         kv_cache_sf: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        k_scale_per_token_head: Optional[torch.Tensor] = None,
+        v_scale_per_token_head: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]: ...
 
     @flashinfer_api
@@ -1233,6 +1297,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
         q_len_per_req: Optional[int] = 1,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
         kv_cache_sf: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        k_scale_per_token_head: Optional[torch.Tensor] = None,
+        v_scale_per_token_head: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         r"""Compute batch decode attention between query and paged kv cache.
 
@@ -1289,6 +1355,33 @@ class BatchDecodeWithPagedKVCacheWrapper:
         """
         if enable_pdl is None:
             enable_pdl = device_support_pdl(q.device)
+
+        # Backend guard for per-token-head scales
+        if k_scale_per_token_head is not None or v_scale_per_token_head is not None:
+            if self._backend not in ("fa2", "auto"):
+                raise ValueError(
+                    "fp8_per_token_head is only supported with fa2 backend, "
+                    f"got backend={self._backend}"
+                )
+            if self._backend == "auto":
+                self._backend = "fa2"
+
+            # Auto-cast scale tensors to float32 (kernel reads as float32 pointer)
+            if k_scale_per_token_head is not None:
+                k_scale_per_token_head = k_scale_per_token_head.to(
+                    torch.float32
+                ).contiguous()
+            if v_scale_per_token_head is not None:
+                v_scale_per_token_head = v_scale_per_token_head.to(
+                    torch.float32
+                ).contiguous()
+
+        # Normalize per-token-head params based on plan flags
+        if not getattr(self, "_use_k_scale_per_token_head", False):
+            k_scale_per_token_head = None
+        if not getattr(self, "_use_v_scale_per_token_head", False):
+            v_scale_per_token_head = None
+
         k_cache, v_cache = _unpack_paged_kv_cache(paged_kv_cache, self._kv_layout)
 
         if (
@@ -1419,6 +1512,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
                             "maybe_alibi_slopes": lambda: _get_cache_alibi_slopes_buf(
                                 q.shape[1], q.device
                             ),
+                            "k_scale_per_token_head": k_scale_per_token_head,
+                            "v_scale_per_token_head": v_scale_per_token_head,
                         },
                         args,
                     )
@@ -1461,6 +1556,16 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     skip_softmax_threshold_scale_factor,
                     True,  # uses_shared_paged_kv_idx
                 ]
+                # Always pass per-token-head args as fixed positional params (fa2 only)
+                # Already normalized to None at entry when flag is False
+                # trtllm-gen paged_run does not accept these params
+                if self._backend == "fa2":
+                    run_args.extend(
+                        [
+                            k_scale_per_token_head,
+                            v_scale_per_token_head,
+                        ]
+                    )
 
             self._cached_module.paged_run(*run_args)
         else:
@@ -1501,12 +1606,16 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     )
                 )
             else:
+                # Pass args in order matching run_batch_decode signature:
+                # alibi_slopes, logits_soft_cap, sm_scale, rope_scale, rope_theta, k_scale_pth, v_scale_pth
                 run_args += [
                     _get_cache_alibi_slopes_buf(q.shape[1], q.device),
                     logits_soft_cap,
                     sm_scale,
                     rope_scale,
                     rope_theta,
+                    k_scale_per_token_head,
+                    v_scale_per_token_head,
                 ]
 
             self._cached_module.run(*run_args)

@@ -11,7 +11,7 @@
 using namespace flashinfer;
 
 #define ADDITIONAL_FUNC_PARAMS {{ additional_func_params }}
-#define ADDITIONAL_PARAMS_SETTER {{ additional_params_setter }}
+#define ADDITIONAL_PARAMS_SETTER {{ additional_params_setter | replace('params.', 'params[i].') }}
 
 #ifdef FLASHINFER_ENABLE_PROFILER
 #define PROFILER_PARAMS_SETTER \

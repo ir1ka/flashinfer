@@ -328,6 +328,13 @@ def get_trtllm_gen_prefill_module():
 
 @functools.cache
 def get_single_prefill_module(backend, *args):
+    # Extract per-token-head flags from args for conditional param passing
+    # args = (dtype_q, dtype_kv, dtype_o, head_dim_qk, head_dim_vo,
+    #         pos_encoding_mode, use_sliding_window, use_logits_soft_cap,
+    #         use_fp16_qk_reduction, use_k_scale_per_token_head, use_v_scale_per_token_head)
+    _use_k_scale_per_token_head = len(args) >= 10 and args[9]
+    _use_v_scale_per_token_head = len(args) >= 11 and args[10]
+
     uri = get_single_prefill_uri(backend, *args)
     module = gen_single_prefill_module(backend, *args).build_and_load()
     run_func = module.run
@@ -356,6 +363,8 @@ def get_single_prefill_module(backend, *args):
         scale_v: Optional[torch.Tensor],
         rope_scale: float,
         rope_theta: float,
+        k_scale_per_token_head: Optional[torch.Tensor],
+        v_scale_per_token_head: Optional[torch.Tensor],
     ) -> None:
         if backend == "fa3":
             scale_v_tensor, scale_v_scalar = _split_scale_param(scale_v)
@@ -398,7 +407,9 @@ def get_single_prefill_module(backend, *args):
                     scale_v_scalar,
                 )
         else:
-            run_func(
+            # Build args matching ADDITIONAL_FUNC_PARAMS order:
+            # all tensors first (base + per-token-head), then all scalars
+            fa2_args = [
                 q,
                 k,
                 v,
@@ -410,11 +421,43 @@ def get_single_prefill_module(backend, *args):
                 window_left,
                 maybe_packed_custom_mask,
                 maybe_alibi_slopes,
-                logits_soft_cap,
-                sm_scale,
-                1.0 / rope_scale,  # rope_rcp_scale
-                1.0 / rope_theta,  # rope_rcp_theta
+            ]
+            # Per-token-head tensors (before base scalars)
+            if _use_k_scale_per_token_head:
+                fa2_args.append(k_scale_per_token_head)
+            if _use_v_scale_per_token_head:
+                fa2_args.append(v_scale_per_token_head)
+            # Base scalars
+            fa2_args.extend(
+                [
+                    logits_soft_cap,
+                    sm_scale,
+                    1.0 / rope_scale,  # rope_rcp_scale
+                    1.0 / rope_theta,  # rope_rcp_theta
+                ]
             )
+            # Per-token-head strides (after base scalars)
+            # 2 strides: stride_batch, stride_seq
+            # Single prefill has no batch dim (request_idx=0), stride_batch=1 (innermost dim)
+            if _use_k_scale_per_token_head:
+                fa2_args.extend(
+                    [
+                        1,  # stride_batch (not used, request_idx=0)
+                        k_scale_per_token_head.size(1)
+                        if k_scale_per_token_head is not None
+                        else 0,  # stride_seq
+                    ]
+                )
+            if _use_v_scale_per_token_head:
+                fa2_args.extend(
+                    [
+                        1,  # stride_batch (not used, request_idx=0)
+                        v_scale_per_token_head.size(1)
+                        if v_scale_per_token_head is not None
+                        else 0,  # stride_seq
+                    ]
+                )
+            run_func(*fa2_args)
         return o
 
     @register_fake_op(f"flashinfer::{uri}_run")
@@ -443,6 +486,13 @@ def get_single_prefill_module(backend, *args):
 
 @functools.cache
 def get_batch_prefill_module(backend, *args):
+    # Extract per-token-head flags from args for use in paged_run wrapper
+    # args = (dtype_q, dtype_kv, dtype_o, dtype_idx, head_dim_qk, head_dim_vo,
+    #         pos_encoding_mode, use_sliding_window, use_logits_soft_cap,
+    #         use_fp16_qk_reduction, use_k_scale_per_token_head, use_v_scale_per_token_head)
+    _use_k_scale_per_token_head = len(args) >= 11 and args[10]
+    _use_v_scale_per_token_head = len(args) >= 12 and args[11]
+
     if backend == "trtllm-gen":
         uri = "trtllm_gen_context"
         module = get_trtllm_gen_prefill_module()
@@ -677,6 +727,8 @@ def get_batch_prefill_module(backend, *args):
         value_block_scales: Optional[torch.Tensor] = None,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
         uses_shared_paged_kv_idx: bool = True,
+        k_scale_per_token_head: Optional[torch.Tensor] = None,
+        v_scale_per_token_head: Optional[torch.Tensor] = None,
     ) -> None:
         if backend == "trtllm-gen":
             assert maybe_lse is None
@@ -717,7 +769,9 @@ def get_batch_prefill_module(backend, *args):
             )
         elif backend == "fa2":
             assert not is_float8(q)
-            paged_run_func(
+            # Build args matching ADDITIONAL_FUNC_PARAMS order:
+            # all tensors first (base + per-token-head), then all scalars (base + strides)
+            fa2_args = [
                 float_workspace_buffer,
                 int_workspace_buffer,
                 plan_info_vec,
@@ -740,12 +794,46 @@ def get_batch_prefill_module(backend, *args):
                 maybe_prefix_len_ptr,
                 maybe_token_pos_in_items_ptr,
                 maybe_max_item_len_ptr,
-                logits_soft_cap,
-                sm_scale,
-                1.0 / rope_scale,  # rope_rcp_scale
-                1.0 / rope_theta,  # rope_rcp_theta
-                token_pos_in_items_len,
+            ]
+            # Per-token-head tensors (before base scalars)
+            if _use_k_scale_per_token_head:
+                fa2_args.append(k_scale_per_token_head)
+            if _use_v_scale_per_token_head:
+                fa2_args.append(v_scale_per_token_head)
+            # Base scalars
+            fa2_args.extend(
+                [
+                    logits_soft_cap,
+                    sm_scale,
+                    1.0 / rope_scale,  # rope_rcp_scale
+                    1.0 / rope_theta,  # rope_rcp_theta
+                    token_pos_in_items_len,
+                ]
             )
+            # Per-token-head strides (after base scalars)
+            if _use_k_scale_per_token_head:
+                if k_scale_per_token_head is not None:
+                    fa2_args.extend(
+                        [
+                            k_scale_per_token_head.size(1)
+                            * k_scale_per_token_head.size(2),
+                            k_scale_per_token_head.size(2),
+                        ]
+                    )
+                else:
+                    fa2_args.extend([0, 0])
+            if _use_v_scale_per_token_head:
+                if v_scale_per_token_head is not None:
+                    fa2_args.extend(
+                        [
+                            v_scale_per_token_head.size(1)
+                            * v_scale_per_token_head.size(2),
+                            v_scale_per_token_head.size(2),
+                        ]
+                    )
+                else:
+                    fa2_args.extend([0, 0])
+            paged_run_func(*fa2_args)
         else:
             scale_v_tensor, scale_v_scalar = _split_scale_param(scale_v)
             if not is_float8(q):
@@ -1071,6 +1159,8 @@ def single_prefill_with_kv_cache(
     rope_theta: Optional[float] = None,
     backend: str = "auto",
     return_lse: Literal[False] = False,
+    k_scale_per_token_head: Optional[torch.Tensor] = None,
+    v_scale_per_token_head: Optional[torch.Tensor] = None,
 ) -> torch.Tensor: ...
 
 
@@ -1096,6 +1186,8 @@ def single_prefill_with_kv_cache(
     rope_theta: Optional[float] = None,
     backend: str = "auto",
     return_lse: Literal[True] = True,
+    k_scale_per_token_head: Optional[torch.Tensor] = None,
+    v_scale_per_token_head: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]: ...
 
 
@@ -1121,6 +1213,8 @@ def single_prefill_with_kv_cache(
     rope_theta: Optional[float] = None,
     backend: str = "auto",
     return_lse: bool = False,
+    k_scale_per_token_head: Optional[torch.Tensor] = None,
+    v_scale_per_token_head: Optional[torch.Tensor] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     r"""Prefill/Append attention with KV cache for single request, return the attention
     output.
@@ -1286,6 +1380,26 @@ def single_prefill_with_kv_cache(
         if scale_v is None:
             scale_v = torch.ones(v.shape[1], dtype=torch.float32, device=q.device)
 
+    # Backend guard for per-token-head scales
+    if k_scale_per_token_head is not None or v_scale_per_token_head is not None:
+        if backend not in ("fa2", "auto"):
+            raise ValueError(
+                "fp8_per_token_head is only supported with fa2 backend, "
+                f"got backend={backend}"
+            )
+        if backend == "auto":
+            backend = "fa2"
+
+        # Auto-cast scale tensors to float32 (kernel reads as float32 pointer)
+        if k_scale_per_token_head is not None:
+            k_scale_per_token_head = k_scale_per_token_head.to(
+                torch.float32
+            ).contiguous()
+        if v_scale_per_token_head is not None:
+            v_scale_per_token_head = v_scale_per_token_head.to(
+                torch.float32
+            ).contiguous()
+
     if backend == "auto":
         backend = determine_attention_backend(
             q.device,
@@ -1312,6 +1426,8 @@ def single_prefill_with_kv_cache(
         window_left >= 0,  # use_sliding_window
         logits_soft_cap > 0,  # use_logits_soft_cap
         use_fp16_qk_reduction,
+        k_scale_per_token_head is not None,  # use_k_scale_per_token_head
+        v_scale_per_token_head is not None,  # use_v_scale_per_token_head
     )
 
     module.run(
@@ -1335,6 +1451,8 @@ def single_prefill_with_kv_cache(
         scale_v,
         rope_scale,
         rope_theta,
+        k_scale_per_token_head,
+        v_scale_per_token_head,
     )
 
     return (out, lse) if return_lse else out
@@ -1703,6 +1821,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
         max_sequence_kv: Optional[int] = None,
         fixed_split_size: Optional[int] = None,
         disable_split_kv: bool = False,
+        use_k_scale_per_token_head: bool = False,
+        use_v_scale_per_token_head: bool = False,
     ) -> None:
         r"""Plan batch prefill/append attention on Paged KV-Cache for given problem specification.
 
@@ -1813,6 +1933,10 @@ class BatchPrefillWithPagedKVCacheWrapper:
             and lead to a varied number of launched CTAs.
         disable_split_kv : bool,
             Whether to disable the split-kv for determinism in CUDA Graph, defaults to ``False``.
+        use_k_scale_per_token_head : bool
+            Whether to enable FP8 per-token-head K scale support. Defaults to ``False``.
+        use_v_scale_per_token_head : bool
+            Whether to enable FP8 per-token-head V scale support. Defaults to ``False``.
         Note
         ----
         The :meth:`plan` method should be called before any :meth:`run` or
@@ -1994,6 +2118,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     window_left >= 0,  # use_sliding_window
                     logits_soft_cap > 0,  # use_logits_soft_cap
                     use_fp16_qk_reduction,
+                    use_k_scale_per_token_head,
+                    use_v_scale_per_token_head,
                 )
 
                 self._cached_module = get_batch_prefill_module(
@@ -2067,6 +2193,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._rope_theta = rope_theta
         self._seq_lens_kv = seq_lens
         self._seq_lens_q = seq_lens_q if seq_lens_q is not None else seq_lens
+        self._use_k_scale_per_token_head = use_k_scale_per_token_head
+        self._use_v_scale_per_token_head = use_v_scale_per_token_head
 
     begin_forward = plan
 
@@ -2112,6 +2240,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
         sinks: Optional[torch.Tensor] = None,
         kv_cache_sf: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
+        k_scale_per_token_head: Optional[torch.Tensor] = None,
+        v_scale_per_token_head: Optional[torch.Tensor] = None,
     ) -> torch.Tensor: ...
 
     @overload
@@ -2130,6 +2260,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
         sinks: Optional[torch.Tensor] = None,
         kv_cache_sf: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
+        k_scale_per_token_head: Optional[torch.Tensor] = None,
+        v_scale_per_token_head: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]: ...
 
     @flashinfer_api
@@ -2149,6 +2281,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
         sinks: Optional[torch.Tensor] = None,
         kv_cache_sf: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
+        k_scale_per_token_head: Optional[torch.Tensor] = None,
+        v_scale_per_token_head: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         r"""Compute batch prefill/append attention between query and paged kv-cache.
 
@@ -2213,6 +2347,33 @@ class BatchPrefillWithPagedKVCacheWrapper:
         """
         if enable_pdl is None:
             enable_pdl = device_support_pdl(q.device)
+
+        # Backend guard for per-token-head scales
+        if k_scale_per_token_head is not None or v_scale_per_token_head is not None:
+            if self._backend not in ("fa2", "auto"):
+                raise ValueError(
+                    "fp8_per_token_head is only supported with fa2 backend, "
+                    f"got backend={self._backend}"
+                )
+            if self._backend == "auto":
+                self._backend = "fa2"
+
+            # Auto-cast scale tensors to float32 (kernel reads as float32 pointer)
+            if k_scale_per_token_head is not None:
+                k_scale_per_token_head = k_scale_per_token_head.to(
+                    torch.float32
+                ).contiguous()
+            if v_scale_per_token_head is not None:
+                v_scale_per_token_head = v_scale_per_token_head.to(
+                    torch.float32
+                ).contiguous()
+
+        # Normalize per-token-head params based on plan flags
+        if not getattr(self, "_use_k_scale_per_token_head", False):
+            k_scale_per_token_head = None
+        if not getattr(self, "_use_v_scale_per_token_head", False):
+            v_scale_per_token_head = None
+
         k_cache, v_cache = _unpack_paged_kv_cache(paged_kv_cache, self._kv_layout)
         _check_cached_qkv_data_type(
             q, k_cache, self._cached_q_data_type, self._cached_kv_data_type
@@ -2393,6 +2554,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
                             "maybe_alibi_slopes": lambda: _get_cache_alibi_slopes_buf(
                                 q.shape[1], q.device
                             ),
+                            "k_scale_per_token_head": k_scale_per_token_head,
+                            "v_scale_per_token_head": v_scale_per_token_head,
                         },
                         args,
                     )
@@ -2436,8 +2599,12 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     key_block_scales,
                     value_block_scales,
                     skip_softmax_threshold_scale_factor,
-                    True,  # uses_shared_paged_kv_idx
+                    True,  # uses_shared_paged_kv_idx,
                 ]
+                # Per-token-head args only for fa2 (trtllm-gen paged_run does not accept them)
+                # Already normalized to None at entry when flag is False
+                if self._backend == "fa2":
+                    run_args.extend([k_scale_per_token_head, v_scale_per_token_head])
 
             assert self._cached_module is not None, "cached module is not initialized"
             self._cached_module.paged_run(*run_args)
