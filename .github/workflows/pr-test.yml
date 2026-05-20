@@ -129,6 +129,7 @@ jobs:
   # Setup - Read docker tag and check if build should be skipped
   # ---------------------------------------------------------------------------
   setup:
+    if: github.repository == 'flashinfer-ai/flashinfer'
     name: Setup
     needs: gate
     if: needs.gate.outputs.authorized == 'true'

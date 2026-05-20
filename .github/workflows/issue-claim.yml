@@ -28,7 +28,8 @@ jobs:
       github.event_name == 'issue_comment' &&
       !github.event.issue.pull_request &&
       github.event.comment.user.type != 'Bot' &&
-      (startsWith(github.event.comment.body, '!claim') || startsWith(github.event.comment.body, '!assign'))
+      (startsWith(github.event.comment.body, '!claim') || startsWith(github.event.comment.body, '!assign')) &&
+      github.repository == 'flashinfer-ai/flashinfer'
     runs-on: ubuntu-latest
     timeout-minutes: 5
 
@@ -246,7 +247,7 @@ jobs:
 
   auto-assign-on-accept:
     # Poll for users who accepted repo invitations after !assign
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    if: (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && github.repository == 'flashinfer-ai/flashinfer'
     runs-on: ubuntu-latest
     timeout-minutes: 5
 
