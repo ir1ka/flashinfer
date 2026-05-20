@@ -359,7 +359,7 @@ jobs:
 
   publish-to-pypi:
     needs: [setup, create-release]
-    if: github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'workflow_dispatch' && github.repository == 'flashinfer-ai/flashinfer'
     runs-on: ubuntu-latest
     steps:
       - name: Download flashinfer-python artifact
@@ -410,7 +410,7 @@ jobs:
 
   update-wheel-index:
     needs: [setup, create-release]
-    if: github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'workflow_dispatch' && github.repository == 'flashinfer-ai/flashinfer'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout flashinfer repo
