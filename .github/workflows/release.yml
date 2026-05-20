@@ -170,7 +170,7 @@ jobs:
         cuda: ["12.8", "12.9", "13.0"]
         arch: ['x86_64']
 
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, "${{ matrix.arch == 'aarch64' && 'arm64' || 'x64' }}", cpu, on-demand]
 
     steps:
       - name: Display Machine Information
