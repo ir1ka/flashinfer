@@ -168,9 +168,9 @@ jobs:
       fail-fast: false
       matrix:
         cuda: ["12.8", "12.9", "13.0"]
-        arch: ['x86_64', 'aarch64']
+        arch: ['x86_64']
 
-    runs-on: [self-hosted, linux, "${{ matrix.arch == 'aarch64' && 'arm64' || 'x64' }}", cpu, on-demand]
+    runs-on: ubuntu-latest
 
     steps:
       - name: Display Machine Information
@@ -218,6 +218,8 @@ jobs:
             -e AWS_ACCESS_KEY_ID="${{ secrets.SCCACHE_AWS_ACCESS_KEY_ID }}" \
             -e AWS_SECRET_ACCESS_KEY="${{ secrets.SCCACHE_AWS_SECRET_ACCESS_KEY }}" \
             -e SCCACHE_REGION="${{ vars.SCCACHE_REGION }}" \
+            -e MAX_JOBS=2 \
+            -e NVCC_THREADS=2 \
             -w /workspace \
             ${{ env.DOCKER_IMAGE }} \
             bash /workspace/scripts/build_flashinfer_jit_cache_whl.sh
