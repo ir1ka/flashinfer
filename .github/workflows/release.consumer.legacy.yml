@@ -1,4 +1,4 @@
-name: Release
+name: Release flashinfer-jit-cache wheel for consumer legacy GPU
 
 on:
   workflow_dispatch:
@@ -87,81 +87,6 @@ jobs:
             echo "release_tag=${{ inputs.tag }}" >> $GITHUB_OUTPUT
           fi
 
-  build-flashinfer-python:
-    needs: setup
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event_name == 'pull_request' && github.head_ref || inputs.tag }}
-          submodules: true
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.10'
-
-      - name: Install build dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install build wheel
-
-      - name: Build flashinfer-python wheel and sdist
-        run: |
-          echo "Building flashinfer-python..."
-          echo "Git commit: $(git rev-parse HEAD)"
-          if [ -r variant.txt ]; then
-            export FLASHINFER_LOCAL_VERSION=$(cat variant.txt)
-          fi
-          python -m build
-          ls -lh dist/
-
-      - name: Upload flashinfer-python artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: flashinfer-python-dist
-          path: dist/*
-          retention-days: 7
-
-  build-flashinfer-cubin:
-    needs: setup
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event_name == 'pull_request' && github.head_ref || inputs.tag }}
-          submodules: true
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.10'
-
-      - name: Install build dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install build twine wheel
-
-      - name: Build flashinfer-cubin wheel
-        run: |
-          echo "Building flashinfer-cubin..."
-          echo "Git commit: $(git rev-parse HEAD)"
-          cd flashinfer-cubin
-          rm -rf dist build *.egg-info
-          python -m build --wheel
-          ls -lh dist/
-          mkdir -p ../dist
-          cp dist/*.whl ../dist/
-
-      - name: Upload flashinfer-cubin artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: flashinfer-cubin-wheel
-          path: dist/*.whl
-          retention-days: 7
-
   build-flashinfer-jit-cache:
     needs: setup
     strategy:
@@ -189,7 +114,7 @@ jobs:
       - name: Build wheel in container
         env:
           DOCKER_IMAGE: ${{ matrix.arch == 'aarch64' && format('pytorch/manylinuxaarch64-builder:cuda{0}', matrix.cuda) || format('pytorch/manylinux2_28-builder:cuda{0}', matrix.cuda) }}
-          FLASHINFER_CUDA_ARCH_LIST: ${{ matrix.cuda < '12.9' && '7.5 8.0 8.9 9.0a 10.0a 12.0a' || (matrix.cuda < '13.0' && '7.5 8.0 8.9 9.0a 10.0a 10.3a 12.0f' || (matrix.arch == 'aarch64' && '7.5 8.0 8.9 9.0a 10.0a 10.3a 11.0a 12.0f' || '7.5 8.0 8.9 9.0a 10.0a 10.3a 12.0f')) }}
+          FLASHINFER_CUDA_ARCH_LIST: '7.5 8.6 8.9'
         run: |
           # Extract CUDA major and minor versions
           CUDA_MAJOR=$(echo "${{ matrix.cuda }}" | cut -d'.' -f1)
@@ -200,6 +125,7 @@ jobs:
           if [ -r variant.txt ]; then
             export FLASHINFER_LOCAL_VERSION=$(cat variant.txt).$FLASHINFER_LOCAL_VERSION
           fi
+          export FLASHINFER_LOCAL_VERSION=consumer.legacy.$FLASHINFER_LOCAL_VERSION
 
           mkdir -p ${{ github.workspace }}/ci-cache
 
@@ -240,7 +166,7 @@ jobs:
           retention-days: 7
 
   create-release:
-    needs: [setup, build-flashinfer-python, build-flashinfer-cubin, build-flashinfer-jit-cache]
+    needs: [setup, build-flashinfer-jit-cache]
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     permissions:
@@ -301,30 +227,6 @@ jobs:
             --title "Release v${{ needs.setup.outputs.version }}" \
             --notes "$NOTES"
 
-      - name: Download flashinfer-python artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: flashinfer-python-dist
-          path: dist-python/
-
-      - name: Upload flashinfer-python to release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh release upload "${{ needs.setup.outputs.release_tag }}" dist-python/* --clobber
-
-      - name: Download flashinfer-cubin artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: flashinfer-cubin-wheel
-          path: dist-cubin/
-
-      - name: Upload flashinfer-cubin to release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh release upload "${{ needs.setup.outputs.release_tag }}" dist-cubin/* --clobber
-
       - name: Upload flashinfer-jit-cache wheels to release (one at a time to avoid OOM)
         env:
           GH_TOKEN: ${{ github.token }}
@@ -354,102 +256,3 @@ jobs:
               rm -rf dist-jit-cache/*
             done
           done
-
-  publish-to-pypi:
-    needs: [setup, create-release]
-    if: github.event_name == 'workflow_dispatch' && github.repository == 'flashinfer-ai/flashinfer'
-    runs-on: ubuntu-latest
-    steps:
-      - name: Download flashinfer-python artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: flashinfer-python-dist
-          path: dist-python/
-
-      - name: Download flashinfer-cubin artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: flashinfer-cubin-wheel
-          path: dist-cubin/
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.10'
-
-      - name: Install twine
-        run: |
-          python -m pip install --upgrade pip
-          pip install twine
-
-      - name: Check packages with twine
-        run: |
-          echo "Running twine check..."
-          twine check dist-python/* dist-cubin/*
-          echo "✓ Package validation passed"
-
-      - name: Upload flashinfer-python to PyPI
-        env:
-          TWINE_USERNAME: __token__
-          TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
-        run: |
-          echo "Uploading flashinfer (sdist and wheel) to PyPI..."
-          twine upload --verbose --non-interactive dist-python/*
-          echo "✓ Successfully uploaded flashinfer to PyPI"
-
-      - name: Upload flashinfer-cubin to PyPI
-        env:
-          TWINE_USERNAME: __token__
-          TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
-        run: |
-          echo "Uploading flashinfer-cubin wheel to PyPI..."
-          twine upload --verbose --non-interactive dist-cubin/*.whl
-          echo "✓ Successfully uploaded flashinfer-cubin to PyPI"
-
-  update-wheel-index:
-    needs: [setup, create-release]
-    if: github.event_name == 'workflow_dispatch' && github.repository == 'flashinfer-ai/flashinfer'
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout flashinfer repo
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.tag }}
-
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: artifacts/
-
-      - name: Collect wheels and sdist
-        run: |
-          mkdir -p dist
-          find artifacts/ -name "*.whl" -exec cp {} dist/ \;
-          find artifacts/ -name "*.tar.gz" -exec cp {} dist/ \;
-          ls -lh dist/
-
-      - name: Clone wheel index
-        run: git clone https://oauth2:${WHL_TOKEN}@github.com/flashinfer-ai/whl.git flashinfer-whl
-        env:
-          WHL_TOKEN: ${{ secrets.WHL_TOKEN }}
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.10'
-
-      - name: Update wheel index
-        run: |
-          python3 scripts/update_whl_index.py \
-            --dist-dir dist \
-            --output-dir flashinfer-whl \
-            --release-tag "${{ needs.setup.outputs.release_tag }}"
-
-      - name: Push wheel index
-        run: |
-          cd flashinfer-whl
-          git config --local user.name "github-actions[bot]"
-          git config --local user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -A
-          git commit -m "update whl for release ${{ needs.setup.outputs.version }}"
-          git push
