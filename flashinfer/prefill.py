@@ -334,6 +334,7 @@ def get_single_prefill_module(backend, *args):
         mask_mode: int,
         layout: int,
         window_left: int,
+        use_per_token_head: bool,
         maybe_packed_custom_mask: Optional[torch.Tensor],
         maybe_alibi_slopes: Optional[torch.Tensor],
         logits_soft_cap: float,
@@ -397,6 +398,7 @@ def get_single_prefill_module(backend, *args):
                 mask_mode,
                 layout,
                 window_left,
+                use_per_token_head,
                 maybe_packed_custom_mask,
                 maybe_alibi_slopes,
                 maybe_k_cache_sf,
@@ -475,6 +477,7 @@ def get_batch_prefill_module(backend, *args):
         layout: int,
         window_left: int,
         enable_pdl: bool,
+        use_per_token_head: bool,
         maybe_custom_mask: Optional[torch.Tensor],
         maybe_mask_indptr: Optional[torch.Tensor],
         maybe_alibi_slopes: Optional[torch.Tensor],
@@ -511,6 +514,7 @@ def get_batch_prefill_module(backend, *args):
                 layout,
                 window_left,
                 enable_pdl,
+                use_per_token_head,
                 maybe_custom_mask,
                 maybe_mask_indptr,
                 maybe_alibi_slopes,
@@ -646,6 +650,7 @@ def get_batch_prefill_module(backend, *args):
         layout: int,
         window_left: int,
         enable_pdl: bool,
+        use_per_token_head: bool,
         maybe_custom_mask: Optional[torch.Tensor],
         maybe_mask_indptr: Optional[torch.Tensor],
         maybe_alibi_slopes: Optional[torch.Tensor],
@@ -734,6 +739,7 @@ def get_batch_prefill_module(backend, *args):
                 layout,
                 window_left,
                 enable_pdl,
+                use_per_token_head,
                 maybe_custom_mask,
                 maybe_mask_indptr,
                 maybe_alibi_slopes,
@@ -1115,6 +1121,7 @@ def single_prefill_with_kv_cache(
     kv_cache_sf: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     k_scale: Optional[float] = None,
     v_scale: Optional[float] = None,
+    use_per_token_head: bool = False,
 ) -> torch.Tensor: ...
 
 
@@ -1143,6 +1150,7 @@ def single_prefill_with_kv_cache(
     kv_cache_sf: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     k_scale: Optional[float] = None,
     v_scale: Optional[float] = None,
+    use_per_token_head: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]: ...
 
 
@@ -1171,6 +1179,7 @@ def single_prefill_with_kv_cache(
     kv_cache_sf: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     k_scale: Optional[float] = None,
     v_scale: Optional[float] = None,
+    use_per_token_head: bool = False,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     r"""Prefill/Append attention with KV cache for single request, return the attention
     output.
@@ -1251,10 +1260,17 @@ def single_prefill_with_kv_cache(
         Both ``k_scales`` and ``v_scales`` use a linear (row-major) layout, and both have dtype ``torch.float8_e4m3fn``.
 
         Currently, NVFP4 KV only supports `fa2` backend.
-    k_scale : Optional[Union[float, torch.Tensor]]
+    k_scale : Optional[float]
         The calibration scale of key for fp8 or nvfp4 input, if not provided, will be set to ``1.0``.
-    v_scale : Optional[Union[float, torch.Tensor]]
+    v_scale : Optional[float]
         The calibration scale of value for fp8 or nvfp4 input, if not provided, will be set to ``1.0``.
+    use_per_token_head : bool
+        Whether to use FP8 per-token-head inline scales. When enabled, the KV cache
+        should have a float32 scale stored immediately after each token-head's FP8 data
+        (at offset ``head_dim`` in bytes). The KV cache tensor should be created with
+        stride ``head_dim + 16`` (16B aligned) along the head dimension to accommodate
+        the inline scale. Only ``fa2`` backend is supported.
+        Defaults to ``False``.
 
     Returns
     -------
@@ -1348,14 +1364,21 @@ def single_prefill_with_kv_cache(
             scale_v = torch.ones(v.shape[1], dtype=torch.float32, device=q.device)
 
     if backend == "auto":
-        backend = determine_attention_backend(
-            q.device,
-            PosEncodingMode[pos_encoding_mode].value,
-            use_fp16_qk_reduction,
-            packed_custom_mask is not None,  # use_custom_mask
-            q.dtype,
-            k.dtype,
+        backend = (
+            "fa2"
+            if use_per_token_head
+            else determine_attention_backend(
+                q.device,
+                PosEncodingMode[pos_encoding_mode].value,
+                use_fp16_qk_reduction,
+                packed_custom_mask is not None,  # use_custom_mask
+                q.dtype,
+                k.dtype,
+            )
         )
+    assert not use_per_token_head or backend == "fa2", (
+        f"The per token head is incompatible with {backend}"
+    )
 
     # Unpack NVFP4 scale factors
     k_sf, v_sf = None, None
@@ -1395,6 +1418,7 @@ def single_prefill_with_kv_cache(
         mask_mode,
         TensorLayout[kv_layout].value,
         window_left,
+        use_per_token_head,
         packed_custom_mask,
         get_alibi_slopes(q.shape[1], device=q.device)
         if pos_encoding_mode == "ALIBI"
@@ -1580,6 +1604,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         backend: str = "auto",
         jit_args: Optional[List[Any]] = None,
         jit_kwargs: Optional[Dict[str, Any]] = None,
+        use_per_token_head: bool = False,
     ) -> None:
         r"""Constructor of :class:`BatchPrefillWithPagedKVCacheWrapper`.
 
@@ -1643,6 +1668,14 @@ class BatchPrefillWithPagedKVCacheWrapper:
 
         jit_kwargs : Optional[Dict[str, Any]]
             The keyword arguments to create the JIT module, defaults to None.
+
+        use_per_token_head : bool
+            Whether to use FP8 per-token-head inline scales. When enabled, the KV cache
+            should have a float32 scale stored immediately after each token-head's FP8 data
+            (at offset ``head_dim`` in bytes). The KV cache tensor should be created with
+            stride ``head_dim + 16`` (16B aligned) along the head dimension to accommodate
+            the inline scale. Only ``fa2`` backend is supported.
+            Defaults to ``False``.
         """
         _check_kv_layout(kv_layout)
 
@@ -1732,6 +1765,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._seq_lens_kv = None
         self._seq_lens_q = None
         self._block_tables = None
+        self._use_per_token_head = use_per_token_head
 
     @property
     def is_cuda_graph_enabled(self) -> bool:
@@ -2068,15 +2102,25 @@ class BatchPrefillWithPagedKVCacheWrapper:
         if self._jit_module is not None:
             self._cached_module = self._jit_module
         else:
+            assert not self._use_per_token_head or self._backend in ["auto", "fa2"], (
+                f"The per token head is incompatible with {self._backend}"
+            )
             if self._backend == "auto":
-                self._backend = determine_attention_backend(
-                    self.device,
-                    PosEncodingMode[pos_encoding_mode].value,
-                    use_fp16_qk_reduction,
-                    self._custom_mask_buf is not None,  # use_custom_mask
-                    q_data_type,
-                    kv_data_type,
+                self._backend = (
+                    "fa2"
+                    if self._use_per_token_head
+                    else determine_attention_backend(
+                        self.device,
+                        PosEncodingMode[pos_encoding_mode].value,
+                        use_fp16_qk_reduction,
+                        self._custom_mask_buf is not None,  # use_custom_mask
+                        q_data_type,
+                        kv_data_type,
+                    )
                 )
+            assert not self._use_per_token_head or self._backend == "fa2", (
+                f"The per token head is incompatible with {self._backend}"
+            )
             if self._backend != "cudnn":
                 get_module_args = (
                     q_data_type,
@@ -2502,6 +2546,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 TensorLayout[self._kv_layout].value,
                 window_left,
                 enable_pdl,
+                self._use_per_token_head,
             ]
             if self._jit_module is not None:
                 run_args.extend(
@@ -2723,6 +2768,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         backend: str = "auto",
         jit_args: Optional[List[Any]] = None,
         jit_kwargs: Optional[Dict[str, Any]] = None,
+        use_per_token_head: bool = False,
     ) -> None:
         r"""Constructor of :class:`BatchPrefillWithRaggedKVCacheWrapper`.
 
@@ -2776,6 +2822,14 @@ class BatchPrefillWithRaggedKVCacheWrapper:
 
         jit_kwargs : Optional[Dict[str, Any]]
             The keyword arguments to create the JIT module, defaults to None.
+
+        use_per_token_head : bool
+            Whether to use FP8 per-token-head inline scales. When enabled, the KV cache
+            should have a float32 scale stored immediately after each token-head's FP8 data
+            (at offset ``head_dim`` in bytes). The KV cache tensor should be created with
+            stride ``head_dim + 16`` (16B aligned) along the head dimension to accommodate
+            the inline scale. Only ``fa2`` backend is supported.
+            Defaults to ``False``.
         """
         _check_kv_layout(kv_layout)
         if jit_args is not None and backend != "cute-dsl":
@@ -2838,6 +2892,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         self._max_total_num_rows: Optional[int] = None
         self._backend = backend
         self._cached_module = None
+        self._use_per_token_head = use_per_token_head
 
     @property
     def is_cuda_graph_enabled(self) -> bool:
@@ -3179,13 +3234,20 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             self._cached_module = self._jit_module
         else:
             if self._backend == "auto":
-                self._backend = determine_attention_backend(
-                    self.device,
-                    PosEncodingMode[pos_encoding_mode].value,
-                    use_fp16_qk_reduction,
-                    self._custom_mask_buf is not None,  # use_custom_mask
-                    q_data_type,
-                    kv_data_type,
+                self._backend = (
+                    "fa2"
+                    if self._use_per_token_head
+                    else determine_attention_backend(
+                        self.device,
+                        PosEncodingMode[pos_encoding_mode].value,
+                        use_fp16_qk_reduction,
+                        self._custom_mask_buf is not None,  # use_custom_mask
+                        q_data_type,
+                        kv_data_type,
+                    )
+                )
+                assert not self._use_per_token_head or self._backend == "fa2", (
+                    f"The per token head is incompatible with {self._backend}"
                 )
 
             get_module_args = (
@@ -3553,6 +3615,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             TensorLayout[self._kv_layout].value,
             window_left,
             enable_pdl,
+            self._use_per_token_head,
         ]
         if self._jit_module is not None:
             run_args.extend(
