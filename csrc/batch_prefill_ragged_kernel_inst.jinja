@@ -4,6 +4,7 @@
 namespace flashinfer {
 
 constexpr auto use_custom_mask = {{ mask_mode }} == MaskMode::kCustom;
+constexpr auto use_per_token_head = {{ use_per_token_head }};
 
 {% for cta_tile_q in [16, 64, 128] %}
 template cudaError_t BatchPrefillWithRaggedKVCacheDispatched<
