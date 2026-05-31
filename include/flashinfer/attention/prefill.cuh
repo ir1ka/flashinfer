@@ -881,6 +881,23 @@ __device__ __forceinline__ void compute_qk(
       } else {
         k_smem->ldmatrix_m8n8x4(*k_smem_offset_r, b_frag);
       }
+      if constexpr (AttentionVariant::use_per_token_head) {
+        uint32_t kv_base = kv_tile_offset + mma_kv * 16;
+        uint32_t row_t = threadIdx.x % 8;
+        if constexpr (std::is_same_v<typename KTraits::DTypeQ, nv_bfloat16>) {
+          nv_bfloat162 k_sc = __float2bfloat162_rn(k_scale_smem[kv_base + row_t]);
+          ((nv_bfloat162*)b_frag)[0] = __hmul2(((nv_bfloat162*)b_frag)[0], k_sc);
+          ((nv_bfloat162*)b_frag)[1] = __hmul2(((nv_bfloat162*)b_frag)[1], k_sc);
+          ((nv_bfloat162*)b_frag)[2] = __hmul2(((nv_bfloat162*)b_frag)[2], k_sc);
+          ((nv_bfloat162*)b_frag)[3] = __hmul2(((nv_bfloat162*)b_frag)[3], k_sc);
+        } else {
+          half2 k_sc = __float2half2_rn(k_scale_smem[kv_base + row_t]);
+          ((half2*)b_frag)[0] = __hmul2(((half2*)b_frag)[0], k_sc);
+          ((half2*)b_frag)[1] = __hmul2(((half2*)b_frag)[1], k_sc);
+          ((half2*)b_frag)[2] = __hmul2(((half2*)b_frag)[2], k_sc);
+          ((half2*)b_frag)[3] = __hmul2(((half2*)b_frag)[3], k_sc);
+        }
+      }
       *k_smem_offset_r =
           k_smem->template advance_offset_by_row<16, UPCAST_STRIDE_K>(*k_smem_offset_r);
 
@@ -1265,6 +1282,41 @@ __device__ __forceinline__ void compute_sfm_v(
         }
       } else {
         v_smem->ldmatrix_m8n8x4_trans(*v_smem_offset_r, b_frag);
+      }
+      if constexpr (AttentionVariant::use_per_token_head) {
+        uint32_t kv_base = kv_tile_offset + mma_kv * 16;
+        uint32_t row_t = (threadIdx.x % 4) * 2;
+        if constexpr (std::is_same_v<typename KTraits::DTypeQ, nv_bfloat16>) {
+          nv_bfloat16 v_sc_h[4];
+          v_sc_h[0] = __float2bfloat16(v_scale_smem[kv_base + row_t]);
+          v_sc_h[1] = __float2bfloat16(v_scale_smem[kv_base + row_t + 1]);
+          v_sc_h[2] = __float2bfloat16(v_scale_smem[kv_base + row_t + 8]);
+          v_sc_h[3] = __float2bfloat16(v_scale_smem[kv_base + row_t + 9]);
+          nv_bfloat16* b = (nv_bfloat16*)b_frag;
+          b[0] = __hmul(b[0], v_sc_h[0]);
+          b[1] = __hmul(b[1], v_sc_h[1]);
+          b[2] = __hmul(b[2], v_sc_h[2]);
+          b[3] = __hmul(b[3], v_sc_h[3]);
+          b[4] = __hmul(b[4], v_sc_h[0]);
+          b[5] = __hmul(b[5], v_sc_h[1]);
+          b[6] = __hmul(b[6], v_sc_h[2]);
+          b[7] = __hmul(b[7], v_sc_h[3]);
+        } else {
+          half v_sc_h[4];
+          v_sc_h[0] = __float2half(v_scale_smem[kv_base + row_t]);
+          v_sc_h[1] = __float2half(v_scale_smem[kv_base + row_t + 1]);
+          v_sc_h[2] = __float2half(v_scale_smem[kv_base + row_t + 8]);
+          v_sc_h[3] = __float2half(v_scale_smem[kv_base + row_t + 9]);
+          half* b = (half*)b_frag;
+          b[0] = __hmul(b[0], v_sc_h[0]);
+          b[1] = __hmul(b[1], v_sc_h[1]);
+          b[2] = __hmul(b[2], v_sc_h[2]);
+          b[3] = __hmul(b[3], v_sc_h[3]);
+          b[4] = __hmul(b[4], v_sc_h[0]);
+          b[5] = __hmul(b[5], v_sc_h[1]);
+          b[6] = __hmul(b[6], v_sc_h[2]);
+          b[7] = __hmul(b[7], v_sc_h[3]);
+        }
       }
 #pragma unroll
       for (uint32_t mma_q = 0; mma_q < KTraits::NUM_MMA_Q; ++mma_q) {
