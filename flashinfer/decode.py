@@ -376,6 +376,7 @@ def single_decode_with_kv_cache(
     sm_scale: Optional[float] = None,
     rope_scale: Optional[float] = None,
     rope_theta: Optional[float] = None,
+    use_per_token_head: bool = False,
     return_lse: Literal[False] = False,
 ) -> torch.Tensor: ...
 
@@ -396,6 +397,7 @@ def single_decode_with_kv_cache(
     sm_scale: Optional[float] = None,
     rope_scale: Optional[float] = None,
     rope_theta: Optional[float] = None,
+    use_per_token_head: bool = False,
     return_lse: Literal[True] = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]: ...
 
@@ -416,6 +418,7 @@ def single_decode_with_kv_cache(
     sm_scale: Optional[float] = None,
     rope_scale: Optional[float] = None,
     rope_theta: Optional[float] = None,
+    use_per_token_head: bool = False,
     return_lse: bool = False,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     r"""Decode attention with KV Cache for single request, return attention output.
@@ -531,6 +534,7 @@ def single_decode_with_kv_cache(
             window_left != -1,  # use_sliding_window
             logits_soft_cap > 0,  # use_logits_soft_cap
             False,  # use_fp16_qk_reduction
+            use_per_token_head,
         ).run(
             q.unsqueeze(0),
             k,
@@ -567,6 +571,7 @@ def single_decode_with_kv_cache(
             PosEncodingMode[pos_encoding_mode].value,
             window_left != -1,  # use_sliding_window
             logits_soft_cap > 0,  # use_logits_soft_cap
+            use_per_token_head,
         ).run(
             q,
             k,
@@ -855,6 +860,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         seq_lens: Optional[torch.Tensor] = None,
         fixed_split_size: Optional[int] = None,
         disable_split_kv: bool = False,
+        use_per_token_head: bool = False,
     ) -> None:
         r"""Plan batch decode for given problem specification.
 
@@ -1069,6 +1075,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
                         )
                     else:
                         self._backend = "fa2"
+                if use_per_token_head and self._backend == "fa3":
+                    self._backend = "fa2"  # FA3 does not support per-token-head scales
                 self._cached_module = get_batch_prefill_module(
                     self._backend,
                     q_data_type,
@@ -1081,6 +1089,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     window_left != -1,  # use_sliding_window
                     logits_soft_cap > 0,  # use_logits_soft_cap
                     False,  # use_fp16_qk_reduction
+                    use_per_token_head,
                 )
 
             args = [
@@ -1122,6 +1131,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     PosEncodingMode[pos_encoding_mode].value,
                     window_left != -1,  # use_sliding_window
                     logits_soft_cap > 0,  # use_logits_soft_cap
+                    use_per_token_head,
                 )
             self._plan_info = self._cached_module.plan(
                 self._float_workspace_buffer,
@@ -1147,6 +1157,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         self._sm_scale = sm_scale
         self._rope_scale = rope_scale
         self._rope_theta = rope_theta
+        self._use_per_token_head = use_per_token_head
 
     begin_forward = plan
 

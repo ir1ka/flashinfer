@@ -50,6 +50,7 @@ def get_single_decode_uri(
     pos_encoding_mode: int,
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
+    use_per_token_head: bool = False,
 ) -> str:
     return (
         f"single_decode_with_kv_cache_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
@@ -60,6 +61,7 @@ def get_single_decode_uri(
         f"posenc_{pos_encoding_mode}_"
         f"use_swa_{use_sliding_window}_"
         f"use_logits_cap_{use_logits_soft_cap}"
+        + ("_inline_scale" if use_per_token_head else "")
     )
 
 
@@ -73,6 +75,7 @@ def get_batch_decode_uri(
     pos_encoding_mode: int,
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
+    use_per_token_head: bool = False,
 ) -> str:
     return (
         f"batch_decode_with_kv_cache_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
@@ -84,6 +87,7 @@ def get_batch_decode_uri(
         f"posenc_{pos_encoding_mode}_"
         f"use_swa_{use_sliding_window}_"
         f"use_logits_cap_{use_logits_soft_cap}"
+        + ("_inline_scale" if use_per_token_head else "")
     )
 
 
@@ -325,6 +329,7 @@ def get_single_prefill_uri(
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
     use_fp16_qk_reduction: bool,
+    use_per_token_head: bool = False,
 ) -> str:
     return (
         f"single_prefill_with_kv_cache_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
@@ -335,7 +340,9 @@ def get_single_prefill_uri(
         f"posenc_{pos_encoding_mode}_"
         f"use_swa_{use_sliding_window}_"
         f"use_logits_cap_{use_logits_soft_cap}_"
-        f"f16qk_{use_fp16_qk_reduction}" + ("_sm90" if backend == "fa3" else "")
+        f"f16qk_{use_fp16_qk_reduction}"
+        + ("_sm90" if backend == "fa3" else "")
+        + ("_inline_scale" if use_per_token_head else "")
     )
 
 
@@ -381,6 +388,7 @@ def get_batch_prefill_uri(
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
     use_fp16_qk_reduction: bool,
+    use_per_token_head: bool = False,
 ) -> str:
     return (
         f"batch_prefill_with_kv_cache_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
@@ -392,7 +400,9 @@ def get_batch_prefill_uri(
         f"posenc_{pos_encoding_mode}_"
         f"use_swa_{use_sliding_window}_"
         f"use_logits_cap_{use_logits_soft_cap}_"
-        f"f16qk_{use_fp16_qk_reduction}" + ("_sm90" if backend == "fa3" else "")
+        f"f16qk_{use_fp16_qk_reduction}"
+        + ("_sm90" if backend == "fa3" else "")
+        + ("_inline_scale" if use_per_token_head else "")
     )
 
 
@@ -451,6 +461,7 @@ def gen_single_decode_module(
     pos_encoding_mode: int,
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
+    use_per_token_head: bool = False,
 ) -> JitSpec:
     uri = get_single_decode_uri(
         dtype_q,
@@ -461,7 +472,13 @@ def gen_single_decode_module(
         pos_encoding_mode,
         use_sliding_window,
         use_logits_soft_cap,
+        use_per_token_head,
     )
+
+    variant_name = f"DefaultAttention<false, {str(use_sliding_window).lower()}, {str(use_logits_soft_cap).lower()}, {str(pos_encoding_mode == 2).lower()}>"
+    if use_per_token_head:
+        variant_name = f"DefaultAttentionWithInlineScale<false, {str(use_sliding_window).lower()}, {str(use_logits_soft_cap).lower()}, {str(pos_encoding_mode == 2).lower()}>"
+
     return gen_customize_single_decode_module(
         uri,
         dtype_q,
@@ -478,7 +495,7 @@ def gen_single_decode_module(
             "rope_rcp_theta",
         ],  # additional_scalar_names
         ["double", "double", "double", "double"],  # additional_scalar_dtypes
-        f"DefaultAttention<false, {str(use_sliding_window).lower()}, {str(use_logits_soft_cap).lower()}, {str(pos_encoding_mode == 2).lower()}>",  # variant_name
+        variant_name,  # variant_name
         "#include<flashinfer/attention/variants.cuh>",  # variant_decl
         pos_encoding_mode=pos_encoding_mode,
         use_sliding_window=use_sliding_window,
@@ -497,6 +514,7 @@ def gen_single_prefill_module(
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
     use_fp16_qk_reduction: bool,
+    use_per_token_head: bool = False,
 ) -> JitSpec:
     uri = get_single_prefill_uri(
         backend,
@@ -509,6 +527,7 @@ def gen_single_prefill_module(
         use_sliding_window,
         use_logits_soft_cap,
         use_fp16_qk_reduction,
+        use_per_token_head,
     )
 
     # use `fp8_enabled` flag to use separate kernel template
@@ -528,6 +547,8 @@ def gen_single_prefill_module(
         ]
         additional_scalar_dtypes = ["double", "double", "double", "double"]
         variant_name = f"DefaultAttention<use_custom_mask, {str(use_sliding_window).lower()}, {str(use_logits_soft_cap).lower()}, {str(pos_encoding_mode == 2).lower()}>"
+        if use_per_token_head:
+            variant_name = f"DefaultAttentionWithInlineScale<use_custom_mask, {str(use_sliding_window).lower()}, {str(use_logits_soft_cap).lower()}, {str(pos_encoding_mode == 2).lower()}>"
         variant_decl = "#include<flashinfer/attention/variants.cuh>"
     else:
         if not fp8_enabled:
@@ -916,6 +937,7 @@ def gen_batch_decode_module(
     pos_encoding_mode: int,
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
+    use_per_token_head: bool = False,
 ) -> JitSpec:
     uri = get_batch_decode_uri(
         dtype_q,
@@ -927,7 +949,13 @@ def gen_batch_decode_module(
         pos_encoding_mode,
         use_sliding_window,
         use_logits_soft_cap,
+        use_per_token_head,
     )
+
+    variant_name = f"DefaultAttention<false, {str(use_sliding_window).lower()}, {str(use_logits_soft_cap).lower()}, {str(pos_encoding_mode == 2).lower()}>"
+    if use_per_token_head:
+        variant_name = f"DefaultAttentionWithInlineScale<false, {str(use_sliding_window).lower()}, {str(use_logits_soft_cap).lower()}, {str(pos_encoding_mode == 2).lower()}>"
+
     return gen_customize_batch_decode_module(
         uri,
         dtype_q,
@@ -945,7 +973,7 @@ def gen_batch_decode_module(
             "rope_rcp_theta",
         ],  # additional_scalar_names
         ["double", "double", "double", "double"],  # additional_scalar_dtypes
-        f"DefaultAttention<false, {str(use_sliding_window).lower()}, {str(use_logits_soft_cap).lower()}, {str(pos_encoding_mode == 2).lower()}>",  # variant_name
+        variant_name,  # variant_name
         "#include<flashinfer/attention/variants.cuh>",  # variant_decl
         pos_encoding_mode=pos_encoding_mode,
         use_sliding_window=use_sliding_window,
@@ -965,6 +993,7 @@ def gen_batch_prefill_module(
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
     use_fp16_qk_reduction: bool,
+    use_per_token_head: bool = False,
 ) -> JitSpec:
     uri = get_batch_prefill_uri(
         backend,
@@ -978,6 +1007,7 @@ def gen_batch_prefill_module(
         use_sliding_window,
         use_logits_soft_cap,
         use_fp16_qk_reduction,
+        use_per_token_head,
     )
 
     # use `fp8_enabled` flag to use separate kernel template
@@ -1019,6 +1049,8 @@ def gen_batch_prefill_module(
         ]
         additional_scalar_dtypes = ["double", "double", "double", "double", "int64_t"]
         variant_name = f"DefaultAttention<use_custom_mask, {str(use_sliding_window).lower()}, {str(use_logits_soft_cap).lower()}, {str(pos_encoding_mode == 2).lower()}>"
+        if use_per_token_head:
+            variant_name = f"DefaultAttentionWithInlineScale<use_custom_mask, {str(use_sliding_window).lower()}, {str(use_logits_soft_cap).lower()}, {str(pos_encoding_mode == 2).lower()}>"
         variant_decl = "#include<flashinfer/attention/variants.cuh>"
     else:
         if not fp8_enabled:

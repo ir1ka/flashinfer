@@ -34,15 +34,13 @@ void single_decode_with_kv_cache(TensorView q, TensorView k, TensorView v, Tenso
                                  TensorView o, Optional<TensorView> maybe_lse, int64_t layout,
                                  int64_t window_left ADDITIONAL_FUNC_PARAMS) {
   CHECK_INPUT(q);
-  CHECK_INPUT(k);
-  CHECK_INPUT(v);
   CHECK_INPUT(tmp);
   CHECK_DEVICE(k, q);
   CHECK_DEVICE(v, q);
   CHECK_DEVICE(tmp, q);
-  CHECK_DIM(2, q);
   CHECK_DIM(3, k);
   CHECK_DIM(3, v);
+  CHECK_DIM(2, q);
   CHECK_SHAPE(k, v);
   TVM_FFI_ICHECK_EQ(q.size(1), k.size(2));
   TVM_FFI_ICHECK_EQ(v.dtype(), k.dtype());
@@ -85,9 +83,23 @@ void single_decode_with_kv_cache(TensorView q, TensorView k, TensorView v, Tenso
         params.num_kv_heads = num_kv_heads;
         params.q_stride_n = num_qo_heads * head_dim_qk;
         params.q_stride_h = head_dim_qk;
-        params.kv_stride_n =
-            (kv_layout == QKVLayout::kNHD) ? num_kv_heads * head_dim_vo : head_dim_vo;
-        params.kv_stride_h = (kv_layout == QKVLayout::kNHD) ? head_dim_vo : kv_len * head_dim_vo;
+        if constexpr (AttentionVariant::use_per_token_head) {
+          // Per-token-head: stride includes inline scale (head_dim + 16 bytes per row)
+          // kv_stride_n = stride from token N to N+1 within same KV head
+          // kv_stride_h = stride from head H to H+1 within same token
+          // Same pattern as non-per-token-head but with (head_dim + 16) instead of head_dim
+          if (kv_layout == QKVLayout::kNHD) {
+            params.kv_stride_n = num_kv_heads * (head_dim_vo + 16);
+            params.kv_stride_h = head_dim_vo + 16;
+          } else {
+            params.kv_stride_n = head_dim_vo + 16;
+            params.kv_stride_h = num_kv_heads * (head_dim_vo + 16);
+          }
+        } else {
+          params.kv_stride_n =
+              (kv_layout == QKVLayout::kNHD) ? num_kv_heads * head_dim_vo : head_dim_vo;
+          params.kv_stride_h = (kv_layout == QKVLayout::kNHD) ? head_dim_vo : kv_len * head_dim_vo;
+        }
         params.window_left = window_left;
         params.kv_chunk_size = 0;
 

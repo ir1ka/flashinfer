@@ -92,6 +92,14 @@ struct DefaultAttention : AttentionVariantBase {
   })
 };
 
+template <bool use_custom_mask, bool use_sliding_window, bool use_logits_soft_cap, bool use_alibi>
+struct DefaultAttentionWithInlineScale
+    : DefaultAttention<use_custom_mask, use_sliding_window, use_logits_soft_cap, use_alibi> {
+  static constexpr bool use_per_token_head = true;
+  using DefaultAttention<use_custom_mask, use_sliding_window, use_logits_soft_cap,
+                         use_alibi>::DefaultAttention;
+};
+
 };  // namespace flashinfer
 
 #endif  // FLASHINFER_ATTENTION_VARIANTS_CUH_

@@ -1070,6 +1070,7 @@ def single_prefill_with_kv_cache(
     rope_scale: Optional[float] = None,
     rope_theta: Optional[float] = None,
     backend: str = "auto",
+    use_per_token_head: bool = False,
     return_lse: Literal[False] = False,
 ) -> torch.Tensor: ...
 
@@ -1095,6 +1096,7 @@ def single_prefill_with_kv_cache(
     rope_scale: Optional[float] = None,
     rope_theta: Optional[float] = None,
     backend: str = "auto",
+    use_per_token_head: bool = False,
     return_lse: Literal[True] = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]: ...
 
@@ -1120,6 +1122,7 @@ def single_prefill_with_kv_cache(
     rope_scale: Optional[float] = None,
     rope_theta: Optional[float] = None,
     backend: str = "auto",
+    use_per_token_head: bool = False,
     return_lse: bool = False,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     r"""Prefill/Append attention with KV cache for single request, return the attention
@@ -1296,6 +1299,9 @@ def single_prefill_with_kv_cache(
             k.dtype,
         )
 
+    if use_per_token_head and backend == "fa3":
+        backend = "fa2"  # FA3 does not support per-token-head scales
+
     # o_dtype should be provided for FP8 attention
     if o_dtype is None:
         o_dtype = q.dtype
@@ -1312,6 +1318,7 @@ def single_prefill_with_kv_cache(
         window_left >= 0,  # use_sliding_window
         logits_soft_cap > 0,  # use_logits_soft_cap
         use_fp16_qk_reduction,
+        use_per_token_head,
     )
 
     module.run(
@@ -1703,6 +1710,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         max_sequence_kv: Optional[int] = None,
         fixed_split_size: Optional[int] = None,
         disable_split_kv: bool = False,
+        use_per_token_head: bool = False,
     ) -> None:
         r"""Plan batch prefill/append attention on Paged KV-Cache for given problem specification.
 
@@ -1982,6 +1990,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     q_data_type,
                     kv_data_type,
                 )
+            if use_per_token_head and self._backend == "fa3":
+                self._backend = "fa2"  # FA3 does not support per-token-head scales
             if self._backend != "cudnn":
                 get_module_args = (
                     q_data_type,
@@ -1994,6 +2004,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     window_left >= 0,  # use_sliding_window
                     logits_soft_cap > 0,  # use_logits_soft_cap
                     use_fp16_qk_reduction,
+                    use_per_token_head,
                 )
 
                 self._cached_module = get_batch_prefill_module(
@@ -2067,6 +2078,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._rope_theta = rope_theta
         self._seq_lens_kv = seq_lens
         self._seq_lens_q = seq_lens_q if seq_lens_q is not None else seq_lens
+        self._use_per_token_head = use_per_token_head
 
     begin_forward = plan
 
