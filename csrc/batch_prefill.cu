@@ -80,8 +80,8 @@ void BatchPrefillWithRaggedKVCacheRun(TensorView float_workspace_buffer,
                                       TensorView q, TensorView k, TensorView v,
                                       TensorView qo_indptr, TensorView kv_indptr, TensorView o,
                                       Optional<TensorView> maybe_lse, int64_t mask_mode_code,
-                                      int64_t layout, int64_t window_left,
-                                      bool enable_pdl ADDITIONAL_FUNC_PARAMS) {
+                                      int64_t layout, int64_t window_left, bool enable_pdl,
+                                      bool use_per_token_head ADDITIONAL_FUNC_PARAMS) {
   PrefillPlanInfo plan_info;
   plan_info.FromVector(std::vector<int64_t>(plan_info_vec.begin(), plan_info_vec.end()));
   QKVLayout kv_layout = static_cast<QKVLayout>(layout);
@@ -207,8 +207,8 @@ void BatchPrefillWithPagedKVCacheRun(TensorView float_workspace_buffer,
                                      TensorView paged_kv_indptr, TensorView paged_kv_indices,
                                      TensorView paged_kv_last_page_len, TensorView o,
                                      Optional<TensorView> maybe_lse, int64_t mask_mode_code,
-                                     int64_t layout, int64_t window_left,
-                                     bool enable_pdl ADDITIONAL_FUNC_PARAMS) {
+                                     int64_t layout, int64_t window_left, bool enable_pdl,
+                                     bool use_per_token_head ADDITIONAL_FUNC_PARAMS) {
   PrefillPlanInfo plan_info;
   plan_info.FromVector(std::vector<int64_t>(plan_info_vec.begin(), plan_info_vec.end()));
   QKVLayout kv_layout = static_cast<QKVLayout>(layout);

@@ -47,6 +47,7 @@ class BatchAttention:
         self,
         kv_layout: str = "NHD",
         device: str = "cuda",
+        use_per_token_head: bool = False,
     ):
         _check_kv_layout(kv_layout)
         self._kv_layout = kv_layout
@@ -67,6 +68,7 @@ class BatchAttention:
             device=torch.device("cpu"),
             pin_memory=True,
         )
+        self._use_per_token_head = use_per_token_head
 
     @flashinfer_api
     def plan(
@@ -134,6 +136,7 @@ class BatchAttention:
             num_kv_heads,
             head_dim_vo,
             causal,
+            self._use_per_token_head,
         )
 
     @flashinfer_api(trace=batch_attention_run_trace)
@@ -143,8 +146,8 @@ class BatchAttention:
         kv_cache: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
         out: Optional[torch.Tensor] = None,
         lse: Optional[torch.Tensor] = None,
-        k_scale: Optional[torch.Tensor] = None,
-        v_scale: Optional[torch.Tensor] = None,
+        k_scale: Optional[float] = None,
+        v_scale: Optional[float] = None,
         logits_soft_cap: float = 0.0,
         profiler_buffer: Optional[torch.Tensor] = None,
         kv_cache_sf: Optional[
@@ -205,6 +208,7 @@ class BatchAttention:
             v_scale,
             sm_scale,
             logits_soft_cap,
+            self._use_per_token_head,
             # ADDITIONAL_FUNC_PARAMS (maybe_k_cache_sf, maybe_v_cache_sf)
             k_cache_sf,
             v_cache_sf,
