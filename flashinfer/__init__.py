@@ -131,6 +131,9 @@ from .page import append_paged_kv_cache as append_paged_kv_cache
 from .page import append_paged_mla_kv_cache as append_paged_mla_kv_cache
 from .page import get_batch_indices_positions as get_batch_indices_positions
 from .page import get_seq_lens as get_seq_lens
+from .page import (
+    reshape_and_cache_flash_per_token_head as reshape_and_cache_flash_per_token_head,
+)
 from .pod import PODWithPagedKVCacheWrapper as PODWithPagedKVCacheWrapper
 from .pod import BatchPODWithPagedKVCacheWrapper as BatchPODWithPagedKVCacheWrapper
 from .prefill import (

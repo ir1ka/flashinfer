@@ -550,6 +550,21 @@ __device__ __forceinline__ uint32_t dim4_offset(const uint32_t& dim_c, const uin
   return ((idx_d * dim_c + idx_c) * dim_b + idx_b) * dim_a + idx_a;
 }
 
+template <typename T>
+struct finfo;
+
+template <>
+struct finfo<__nv_fp8_e4m3> {
+  static constexpr float max = 448.0f;
+  static constexpr float min = -448.0f;
+};
+
+template <>
+struct finfo<__nv_fp8_e5m2> {
+  static constexpr float max = 57344.0f;
+  static constexpr float min = -57344.0f;
+};
+
 #define DEFINE_HAS_MEMBER(member)                                                              \
   template <typename T, typename = void>                                                       \
   struct has_##member : std::false_type {};                                                    \

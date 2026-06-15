@@ -936,3 +936,178 @@ tgv_gemm_sm100_trace = TraceTemplate(
     reference=_tgv_gemm_sm100_reference,
     init=_tgv_gemm_sm100_init,
 )
+
+
+# ── Reshape and Cache Flash Per-Token-Head (FP8 quantize + paged cache) ──
+
+
+@torch.no_grad()
+def _reshape_and_cache_flash_pth_reference(
+    key: torch.Tensor,
+    value: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    k_scale_cache: torch.Tensor,
+    v_scale_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    **_unused,
+):
+    """Reference for reshape_and_cache_flash_per_token_head.
+
+    Per-token-head FP8 quantize: compute absmax per (token, head),
+    derive scale = absmax / 448, quantize and write to cache + scale cache.
+    """
+    fp8_dtype = k_cache.dtype
+    finfo = torch.finfo(fp8_dtype)
+    quant_max = finfo.max
+
+    num_tokens, num_kv_heads, head_dim = key.shape
+    head_dim_v = value.shape[2]
+
+    for tok in range(num_tokens):
+        slot = int(slot_mapping[tok].item())
+        if slot < 0:
+            continue
+        for h in range(num_kv_heads):
+            # Key
+            k_f32 = key[tok, h, :head_dim].to(torch.float32)
+            k_amax = k_f32.abs().amax().item()
+            k_scale = max(k_amax / quant_max, 1e-6)
+            k_q = (k_f32 / k_scale).clamp(-quant_max, quant_max).to(fp8_dtype)
+            k_cache[slot, h, :head_dim] = k_q
+            k_scale_cache[slot, h] = k_scale
+
+            # Value
+            v_f32 = value[tok, h, :head_dim_v].to(torch.float32)
+            v_amax = v_f32.abs().amax().item()
+            v_scale = max(v_amax / quant_max, 1e-6)
+            v_q = (v_f32 / v_scale).clamp(-quant_max, quant_max).to(fp8_dtype)
+            v_cache[slot, h, :head_dim_v] = v_q
+            v_scale_cache[slot, h] = v_scale
+
+    return k_cache, v_cache, k_scale_cache, v_scale_cache
+
+
+def _reshape_and_cache_flash_pth_init(
+    *,
+    num_tokens: int,
+    num_kv_heads: int = 8,
+    head_dim: int = 128,
+    head_dim_v: int = 0,
+    total_seq_len: int = 0,
+    device: str = "cuda",
+    seed: int = 0,
+    fp8_dtype: str = "float8_e4m3fn",
+):
+    """Build inputs for reshape_and_cache_flash_per_token_head (ragged layout)."""
+    del head_dim_v  # derived from head_dim
+    torch.manual_seed(seed)
+    head_dim_v = head_dim
+    fp8_d = getattr(torch, fp8_dtype)
+    total_seq_len = max(total_seq_len, num_tokens)
+
+    key = (
+        torch.randn(
+            num_tokens, num_kv_heads, head_dim, dtype=torch.bfloat16, device=device
+        )
+        * 0.3
+    )
+    value = (
+        torch.randn(
+            num_tokens, num_kv_heads, head_dim_v, dtype=torch.bfloat16, device=device
+        )
+        * 0.3
+    )
+
+    k_cache = torch.zeros(
+        total_seq_len, num_kv_heads, head_dim, dtype=fp8_d, device=device
+    )
+    v_cache = torch.zeros(
+        total_seq_len, num_kv_heads, head_dim_v, dtype=fp8_d, device=device
+    )
+    k_scale_cache = torch.zeros(
+        total_seq_len, num_kv_heads, dtype=torch.float32, device=device
+    )
+    v_scale_cache = torch.zeros(
+        total_seq_len, num_kv_heads, dtype=torch.float32, device=device
+    )
+    slot_mapping = torch.arange(num_tokens, dtype=torch.int32, device=device)
+
+    return {
+        "key": key,
+        "value": value,
+        "k_cache": k_cache,
+        "v_cache": v_cache,
+        "k_scale_cache": k_scale_cache,
+        "v_scale_cache": v_scale_cache,
+        "slot_mapping": slot_mapping,
+    }
+
+
+reshape_and_cache_flash_pth_trace = TraceTemplate(
+    op_type="page_reshape",
+    name_prefix="reshape_and_cache_flash_pth",
+    description=(
+        "Per-token-head FP8 quantize + cache write. Computes absmax per "
+        "(token, head), derives scale = absmax/QUANT_MAX, quantizes to FP8 "
+        "E4M3/E5M2, and writes to paged/ragged cache with stride-based "
+        "addressing. Supports both paged (4D cache) and ragged (3D cache) layouts."
+    ),
+    axes={
+        "num_tokens": Var(description="Number of input tokens."),
+        "num_kv_heads": Const(abbrev="kv"),
+        "head_dim": Const(abbrev="d"),
+        "head_dim_v": Const(abbrev="dv"),
+        "total_seq_len": Var(description="Total sequence length in cache."),
+    },
+    inputs={
+        "key": Tensor(["num_tokens", "num_kv_heads", "head_dim"]),
+        "value": Tensor(["num_tokens", "num_kv_heads", "head_dim_v"]),
+        "k_cache": Tensor(
+            ["total_seq_len", "num_kv_heads", "head_dim"],
+            dtype="float8_e4m3fn",
+            description="FP8 key cache (ragged layout, 3D).",
+        ),
+        "v_cache": Tensor(
+            ["total_seq_len", "num_kv_heads", "head_dim_v"],
+            dtype="float8_e4m3fn",
+            description="FP8 value cache (ragged layout, 3D).",
+        ),
+        "k_scale_cache": Tensor(
+            ["total_seq_len", "num_kv_heads"],
+            dtype="float32",
+            description="Per-token-head key scale cache.",
+        ),
+        "v_scale_cache": Tensor(
+            ["total_seq_len", "num_kv_heads"],
+            dtype="float32",
+            description="Per-token-head value scale cache.",
+        ),
+        "slot_mapping": Tensor(["num_tokens"], dtype="int32"),
+    },
+    outputs={
+        "k_cache": Tensor(
+            ["total_seq_len", "num_kv_heads", "head_dim"],
+            dtype="float8_e4m3fn",
+            description="Updated FP8 key cache (in-place).",
+        ),
+        "v_cache": Tensor(
+            ["total_seq_len", "num_kv_heads", "head_dim_v"],
+            dtype="float8_e4m3fn",
+            description="Updated FP8 value cache (in-place).",
+        ),
+        "k_scale_cache": Tensor(
+            ["total_seq_len", "num_kv_heads"],
+            dtype="float32",
+            description="Updated key scale cache (in-place).",
+        ),
+        "v_scale_cache": Tensor(
+            ["total_seq_len", "num_kv_heads"],
+            dtype="float32",
+            description="Updated value scale cache (in-place).",
+        ),
+    },
+    tags=["status:verified", "quantization:fp8"],
+    reference=_reshape_and_cache_flash_pth_reference,
+    init=_reshape_and_cache_flash_pth_init,
+)

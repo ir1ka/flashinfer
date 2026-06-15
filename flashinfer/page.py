@@ -23,6 +23,7 @@ from .api_logging import flashinfer_api
 from .trace.templates.page import (
     append_paged_kv_cache_trace,
     append_paged_mla_kv_cache_trace,
+    reshape_and_cache_flash_pth_trace,
 )
 from .jit.page import gen_page_module
 from .utils import (
@@ -403,4 +404,124 @@ def append_paged_kv_cache(
         kv_indptr,
         kv_last_page_len,
         TensorLayout[kv_layout].value,
+    )
+
+
+@register_custom_op(
+    "flashinfer::reshape_and_cache_flash_per_token_head",
+    mutates_args=("k_cache", "v_cache", "k_scale_cache", "v_scale_cache"),
+)
+def _reshape_and_cache_flash_per_token_head_kernel(
+    key: torch.Tensor,
+    value: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    k_scale_cache: torch.Tensor,
+    v_scale_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+) -> None:
+    slot_mapping = slot_mapping.int()
+    get_page_module().reshape_and_cache_flash_per_token_head(
+        key,
+        value,
+        k_cache,
+        v_cache,
+        k_scale_cache,
+        v_scale_cache,
+        slot_mapping,
+    )
+
+
+@register_fake_op("flashinfer::reshape_and_cache_flash_per_token_head")
+def _fake_reshape_and_cache_flash_per_token_head_kernel(
+    key: torch.Tensor,
+    value: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    k_scale_cache: torch.Tensor,
+    v_scale_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+) -> None:
+    pass
+
+
+@flashinfer_api(trace=reshape_and_cache_flash_pth_trace)
+def reshape_and_cache_flash_per_token_head(
+    key: torch.Tensor,
+    value: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    k_scale_cache: torch.Tensor,
+    v_scale_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+) -> None:
+    r"""Quantize key/value per-token-head to FP8 and write to paged/ragged KV cache.
+
+    Computes one scale = absmax / QUANT_MAX per (token, head), stores
+    quantized FP8 data in k_cache/v_cache, and stores the float32
+    scale in k_scale_cache/v_scale_cache.
+
+    Supports both paged and ragged layouts determined by the cache
+    tensor dimensions (4D for paged, 3D for ragged).
+
+    Parameters
+    ----------
+    key : torch.Tensor
+        The key tensor, shape: ``[num_tokens, num_kv_heads, head_dim]``,
+        dtype: float16 or bfloat16.
+    value : torch.Tensor
+        The value tensor, shape: ``[num_tokens, num_kv_heads, head_dim_v]``,
+        dtype: float16 or bfloat16.
+    k_cache : torch.Tensor
+        The key cache, dtype: float8_e4m3fn or float8_e5m2.
+        - Paged: ``[max_num_pages, page_size, num_kv_heads, head_dim]``
+        - Ragged: ``[total_seq_len, num_kv_heads, head_dim]``
+    v_cache : torch.Tensor
+        The value cache, same dtype as k_cache.
+        - Paged: ``[max_num_pages, page_size, num_kv_heads, head_dim_v]``
+        - Ragged: ``[total_seq_len, num_kv_heads, head_dim_v]``
+    k_scale_cache : torch.Tensor
+        The key scale cache, float32, shape:
+        - Paged: ``[max_num_pages, page_size, num_kv_heads]``
+        - Ragged: ``[total_seq_len, num_kv_heads]``
+    v_scale_cache : torch.Tensor
+        The value scale cache, float32, same shape as k_scale_cache.
+    slot_mapping : torch.Tensor
+        The slot mapping, int32, shape: ``[num_tokens]``.
+        For paged layout: absolute slot position (page_idx * page_size + slot_in_page).
+        For ragged layout: position index in the ragged cache.
+
+    Note
+    ----
+    The k_cache and k_scale_cache may share underlying storage via
+    as_strided. The kernel uses stride-based addressing and does not
+    assume contiguous memory.
+    """
+    if key.dtype not in (torch.float16, torch.bfloat16):
+        raise TypeError(f"key dtype must be float16 or bfloat16, got {key.dtype}")
+    if value.dtype != key.dtype:
+        raise TypeError(f"value dtype must match key dtype, got {value.dtype}")
+    if k_cache.dtype not in (torch.float8_e4m3fn, torch.float8_e5m2):
+        raise TypeError(
+            f"k_cache dtype must be float8_e4m3fn or float8_e5m2, got {k_cache.dtype}"
+        )
+    if v_cache.dtype != k_cache.dtype:
+        raise TypeError(f"v_cache dtype must match k_cache dtype, got {v_cache.dtype}")
+    if k_scale_cache.dtype != torch.float32:
+        raise TypeError(
+            f"k_scale_cache dtype must be float32, got {k_scale_cache.dtype}"
+        )
+    if v_scale_cache.dtype != torch.float32:
+        raise TypeError(
+            f"v_scale_cache dtype must be float32, got {v_scale_cache.dtype}"
+        )
+
+    _reshape_and_cache_flash_per_token_head_kernel(
+        key,
+        value,
+        k_cache,
+        v_cache,
+        k_scale_cache,
+        v_scale_cache,
+        slot_mapping,
     )

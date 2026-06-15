@@ -27,5 +27,11 @@ void append_paged_mla_kv_cache(TensorView append_ckv, TensorView append_kpe,
                                TensorView kpe_cache, TensorView kv_indices, TensorView kv_indptr,
                                TensorView kv_last_page_len);
 
+void reshape_and_cache_flash_per_token_head(TensorView key, TensorView value, TensorView k_cache,
+                                            TensorView v_cache, TensorView k_scale_cache,
+                                            TensorView v_scale_cache, TensorView slot_mapping);
+
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(append_paged_kv_cache, append_paged_kv_cache);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(append_paged_mla_kv_cache, append_paged_mla_kv_cache);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(reshape_and_cache_flash_per_token_head,
+                              reshape_and_cache_flash_per_token_head);

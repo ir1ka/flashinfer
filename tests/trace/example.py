@@ -51,6 +51,7 @@ moe_fp8_block_scale_llama4_routing_topk1_e32_h7168_i2048.json
 moe_fp8_block_scale_renormalize_naive_routing_topk8_e32_h7168_i2048.json
 moe_fp8_block_scale_renormalize_routing_topk8_e32_h7168_i2048.json
 moe_fp8_block_scale_topk_routing_topk8_e32_h7168_i2048.json
+reshape_and_cache_flash_pth_kv8_d128_dv128.json
 rmsnorm_h4096.json
 rmsnorm_h7168.json
 rmsnorm_quant_h7168.json
@@ -1115,4 +1116,30 @@ with contextlib.suppress(Exception):
         is_neox=False,
         page_size=_rqfap_PS,
         kv_layout="NHD",
+    )
+
+# reshape_and_cache_flash_per_token_head: FP8 per-token-head quantize + cache write.
+with contextlib.suppress(Exception):
+    from flashinfer import reshape_and_cache_flash_per_token_head
+
+    _rac_B, _rac_H, _rac_D, _rac_T = 8, 8, 128, 32
+    _rac_key = (
+        torch.randn(_rac_B, _rac_H, _rac_D, dtype=torch.bfloat16, device=device) * 0.3
+    )
+    _rac_value = torch.randn_like(_rac_key)
+    _rac_k_cache = torch.zeros(
+        _rac_T, _rac_H, _rac_D, dtype=torch.float8_e4m3fn, device=device
+    )
+    _rac_v_cache = torch.zeros_like(_rac_k_cache)
+    _rac_k_scale = torch.zeros(_rac_T, _rac_H, dtype=torch.float32, device=device)
+    _rac_v_scale = torch.zeros_like(_rac_k_scale)
+    _rac_slot = torch.arange(_rac_B, dtype=torch.int32, device=device)
+    reshape_and_cache_flash_per_token_head(
+        _rac_key,
+        _rac_value,
+        _rac_k_cache,
+        _rac_v_cache,
+        _rac_k_scale,
+        _rac_v_scale,
+        _rac_slot,
     )

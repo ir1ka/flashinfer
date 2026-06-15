@@ -592,6 +592,198 @@ cudaError_t AppendPagedKVMlaCache(paged_kv_mla_t<DType, IdType> paged_kv, DType*
   return cudaSuccess;
 }
 
+/*!
+ * \brief CUDA kernel to quantize key/value per-token-head to FP8 and write to paged/ragged cache
+ * \tparam DTypeIn The input data type (float16/bfloat16)
+ * \tparam DTypeCache The FP8 cache data type (__nv_fp8_e4m3/__nv_fp8_e5m2)
+ * \tparam HEAD_DIM The dimension of each key head
+ * \tparam HEAD_DIM_V The dimension of each value head
+ * \tparam HEAD_SIZE_PADDED next_power_of_2(max(HEAD_DIM, HEAD_DIM_V))
+ * \param key The key tensor [num_tokens, num_kv_heads, head_dim] (contiguous)
+ * \param value The value tensor [num_tokens, num_kv_heads, head_dim_v] (contiguous)
+ * \param k_cache The key cache (FP8)
+ * \param v_cache The value cache (FP8)
+ * \param k_scale_cache The key scale cache (float32)
+ * \param v_scale_cache The value scale cache (float32)
+ * \param slot_mapping The slot mapping [num_tokens]
+ * \param num_tokens Number of tokens
+ * \param num_kv_heads Number of KV heads
+ * \param stride_kc_n Stride in elements over slot dimension of k_cache
+ * \param stride_kc_h Stride in elements over head dimension of k_cache
+ * \param stride_vc_n Stride in elements over slot dimension of v_cache
+ * \param stride_vc_h Stride in elements over head dimension of v_cache
+ * \param stride_ks_h Stride in elements over head dimension of k_scale_cache
+ * \param stride_vs_h Stride in elements over head dimension of v_scale_cache
+ * Note: Follows FlashInfer convention of stride_n + stride_h. The last dimension
+ * (head_dim) is always contiguous (stride=1). Scale cache slot stride is always
+ * num_kv_heads (contiguous). Scale cache is NOT assumed to share storage with cache.
+ */
+template <typename DTypeIn, typename DTypeCache, uint32_t HEAD_DIM, uint32_t HEAD_DIM_V,
+          uint32_t HEAD_SIZE_PADDED>
+__global__ void ReshapeAndCacheFlashPerTokenHeadKernel(
+    const DTypeIn* __restrict__ key, const DTypeIn* __restrict__ value,
+    DTypeCache* __restrict__ k_cache, DTypeCache* __restrict__ v_cache,
+    float* __restrict__ k_scale_cache, float* __restrict__ v_scale_cache,
+    const int32_t* __restrict__ slot_mapping, uint32_t num_tokens, uint32_t num_kv_heads,
+    int64_t stride_kc_n, int64_t stride_kc_h, int64_t stride_vc_n, int64_t stride_vc_h,
+    int64_t stride_ks_h, int64_t stride_vs_h) {
+  uint32_t tok = blockIdx.x;
+  uint32_t head = blockIdx.y;
+
+  if (tok >= num_tokens || head >= num_kv_heads) {
+    return;
+  }
+
+  int32_t slot = slot_mapping[tok];
+  if (slot < 0) {
+    return;
+  }
+
+  // Derive QUANT_MAX from DTypeCache at compile time
+  constexpr float QUANT_MAX = finfo<DTypeCache>::max;
+
+  // Compute scale by finding absmax (key/value are contiguous)
+  float absmax_k = 0.f, absmax_v = 0.f;
+  uint32_t k_base = tok * num_kv_heads * HEAD_DIM + head * HEAD_DIM;
+  uint32_t v_base = tok * num_kv_heads * HEAD_DIM_V + head * HEAD_DIM_V;
+  for (uint32_t i = threadIdx.x; i < HEAD_SIZE_PADDED; i += blockDim.x) {
+    if (i < HEAD_DIM) {
+      float val = static_cast<float>(key[k_base + i]);
+      float aval = fabsf(val);
+      if (aval > absmax_k) {
+        absmax_k = aval;
+      }
+    }
+    if (i < HEAD_DIM_V) {
+      float val = static_cast<float>(value[v_base + i]);
+      float aval = fabsf(val);
+      if (aval > absmax_v) {
+        absmax_v = aval;
+      }
+    }
+  }
+
+  // Warp-level reduction for absmax
+  float warp_max_k = absmax_k;
+  float warp_max_v = absmax_v;
+  for (int mask = warpSize / 2; mask > 0; mask >>= 1) {
+    float val_k = __shfl_down_sync(0xFFFFFFFF, warp_max_k, mask);
+    float val_v = __shfl_down_sync(0xFFFFFFFF, warp_max_v, mask);
+    if (val_k > warp_max_k) warp_max_k = val_k;
+    if (val_v > warp_max_v) warp_max_v = val_v;
+  }
+
+  // Cross-warp reduction: each warp's lane 0 writes its warp max to shared memory,
+  // then all threads read and reduce
+  extern __shared__ char smem_buf[];
+  float* smem_max_k = reinterpret_cast<float*>(smem_buf);
+  float* smem_max_v = smem_max_k + (blockDim.x + warpSize - 1) / warpSize;
+  uint32_t warp_id = threadIdx.x / warpSize;
+  if (threadIdx.x % warpSize == 0) {
+    smem_max_k[warp_id] = warp_max_k;
+    smem_max_v[warp_id] = warp_max_v;
+  }
+  uint32_t num_warps = (blockDim.x + warpSize - 1) / warpSize;
+  __syncthreads();
+  absmax_k = smem_max_k[0];
+  absmax_v = smem_max_v[0];
+  for (uint32_t w = 1; w < num_warps; w++) {
+    if (smem_max_k[w] > absmax_k) absmax_k = smem_max_k[w];
+    if (smem_max_v[w] > absmax_v) absmax_v = smem_max_v[w];
+  }
+
+  // Compute scale
+  float k_scale = fmaxf(absmax_k / QUANT_MAX, 1e-6f);
+  float v_scale = fmaxf(absmax_v / QUANT_MAX, 1e-6f);
+
+  // Compute reciprocal scale for quantization
+  float k_rcp_scale = 1.0f / k_scale;
+  float v_rcp_scale = 1.0f / v_scale;
+
+  // Compute cache offsets using stride_n + stride_h convention.
+  int64_t k_cache_offset = static_cast<int64_t>(slot) * stride_kc_n + head * stride_kc_h;
+  int64_t v_cache_offset = static_cast<int64_t>(slot) * stride_vc_n + head * stride_vc_h;
+  int64_t k_scale_offset = static_cast<int64_t>(slot) * num_kv_heads + head * stride_ks_h;
+  int64_t v_scale_offset = static_cast<int64_t>(slot) * num_kv_heads + head * stride_vs_h;
+
+  // Quantize and write key
+  for (uint32_t i = threadIdx.x; i < HEAD_SIZE_PADDED; i += blockDim.x) {
+    if (i < HEAD_DIM) {
+      float val = static_cast<float>(key[k_base + i]);
+      float qval = fminf(fmaxf(val * k_rcp_scale, -QUANT_MAX), QUANT_MAX);
+      k_cache[k_cache_offset + i] = static_cast<DTypeCache>(qval);
+    }
+  }
+
+  // Quantize and write value
+  for (uint32_t i = threadIdx.x; i < HEAD_SIZE_PADDED; i += blockDim.x) {
+    if (i < HEAD_DIM_V) {
+      float val = static_cast<float>(value[v_base + i]);
+      float qval = fminf(fmaxf(val * v_rcp_scale, -QUANT_MAX), QUANT_MAX);
+      v_cache[v_cache_offset + i] = static_cast<DTypeCache>(qval);
+    }
+  }
+
+  // Write scales (one per warp, use lane 0)
+  if (threadIdx.x == 0) {
+    k_scale_cache[k_scale_offset] = k_scale;
+    v_scale_cache[v_scale_offset] = v_scale;
+  }
+}
+
+/*!
+ * \brief Launch ReshapeAndCacheFlashPerTokenHead kernel
+ * \tparam DTypeIn The input data type
+ * \tparam DTypeCache The FP8 cache data type
+ * \param key The key tensor
+ * \param value The value tensor
+ * \param k_cache The key cache (FP8)
+ * \param v_cache The value cache (FP8)
+ * \param k_scale_cache The key scale cache (float32)
+ * \param v_scale_cache The value scale cache (float32)
+ * \param slot_mapping The slot mapping
+ * \param num_tokens Number of tokens
+ * \param num_kv_heads Number of KV heads
+ * \param head_dim Key head dimension
+ * \param head_dim_v Value head dimension
+ * \param stride_kc_n Stride in elements over slot dimension of k_cache
+ * \param stride_kc_h Stride in elements over head dimension of k_cache
+ * \param stride_vc_n Stride in elements over slot dimension of v_cache
+ * \param stride_vc_h Stride in elements over head dimension of v_cache
+ * \param stride_ks_h Stride in elements over head dimension of k_scale_cache
+ * \param stride_vs_h Stride in elements over head dimension of v_scale_cache
+ * \param stream CUDA stream
+ */
+template <typename DTypeIn, typename DTypeCache>
+cudaError_t ReshapeAndCacheFlashPerTokenHead(
+    const DTypeIn* key, const DTypeIn* value, DTypeCache* k_cache, DTypeCache* v_cache,
+    float* k_scale_cache, float* v_scale_cache, const int32_t* slot_mapping, uint32_t num_tokens,
+    uint32_t num_kv_heads, uint32_t head_dim, uint32_t head_dim_v, int64_t stride_kc_n,
+    int64_t stride_kc_h, int64_t stride_vc_n, int64_t stride_vc_h, int64_t stride_ks_h,
+    int64_t stride_vs_h, cudaStream_t stream = nullptr) {
+  DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
+    DISPATCH_HEAD_DIM(head_dim_v, HEAD_DIM_V, {
+      constexpr uint32_t HEAD_SIZE_PADDED = std::max(HEAD_DIM, HEAD_DIM_V);
+
+      constexpr uint32_t bdx = std::max(32U, std::min(128U, HEAD_SIZE_PADDED));
+      dim3 grid(num_tokens, num_kv_heads);
+      dim3 block(bdx);
+
+      auto kernel = ReshapeAndCacheFlashPerTokenHeadKernel<DTypeIn, DTypeCache, HEAD_DIM,
+                                                           HEAD_DIM_V, HEAD_SIZE_PADDED>;
+      void* args[] = {(void*)&key,          (void*)&value,         (void*)&k_cache,
+                      (void*)&v_cache,      (void*)&k_scale_cache, (void*)&v_scale_cache,
+                      (void*)&slot_mapping, (void*)&num_tokens,    (void*)&num_kv_heads,
+                      (void*)&stride_kc_n,  (void*)&stride_kc_h,   (void*)&stride_vc_n,
+                      (void*)&stride_vc_h,  (void*)&stride_ks_h,   (void*)&stride_vs_h};
+      // Shared memory for cross-warp absmax reduction: 2 floats per warp
+      constexpr size_t smem_bytes = ((bdx + 31U) / 32U) * 2 * sizeof(float);
+      FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, grid, block, args, smem_bytes, stream));
+    });
+  });
+  return cudaSuccess;
+}
+
 }  // namespace flashinfer
 
 #endif  // FLAHSINFER_PAGE_CUH_

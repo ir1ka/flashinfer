@@ -187,3 +187,119 @@ void append_paged_mla_kv_cache(TensorView append_ckv, TensorView append_kpe,
   TVM_FFI_ICHECK(success) << "AppendPagedKVMlaCache failed to dispatch with dtype "
                           << ckv_cache.dtype();
 }
+
+void reshape_and_cache_flash_per_token_head(TensorView key, TensorView value, TensorView k_cache,
+                                            TensorView v_cache, TensorView k_scale_cache,
+                                            TensorView v_scale_cache, TensorView slot_mapping) {
+  CHECK_LAST_DIM_CONTIGUOUS(key);
+  CHECK_LAST_DIM_CONTIGUOUS(value);
+  CHECK_INPUT(slot_mapping);
+  CHECK_DIM(3, key);
+  CHECK_DIM(3, value);
+  CHECK_DIM(1, slot_mapping);
+
+  unsigned int num_tokens = key.size(0);
+  unsigned int num_kv_heads = key.size(1);
+  unsigned int head_dim = key.size(2);
+  unsigned int head_dim_v = value.size(2);
+
+  TVM_FFI_ICHECK_EQ(value.size(0), num_tokens);
+  TVM_FFI_ICHECK_EQ(value.size(1), num_kv_heads);
+  TVM_FFI_ICHECK_EQ(slot_mapping.size(0), num_tokens);
+  TVM_FFI_ICHECK(key.dtype().bits == 16 &&
+                 (key.dtype().code == kDLFloat || key.dtype().code == kDLBfloat))
+      << "key dtype must be float16 or bfloat16, got " << key.dtype();
+  TVM_FFI_ICHECK(value.dtype() == key.dtype()) << "value dtype must match key dtype";
+
+  // Cache dtype must be FP8
+  TVM_FFI_ICHECK(k_cache.dtype().code == kDLFloat8_e4m3fn || k_cache.dtype().code == kDLFloat8_e5m2)
+      << "k_cache dtype must be float8_e4m3fn or float8_e5m2";
+  TVM_FFI_ICHECK(v_cache.dtype() == k_cache.dtype()) << "v_cache dtype must match k_cache dtype";
+
+  // Scale cache must be float32
+  TVM_FFI_ICHECK(k_scale_cache.dtype().code == kDLFloat && k_scale_cache.dtype().bits == 32)
+      << "k_scale_cache dtype must be float32";
+  TVM_FFI_ICHECK(v_scale_cache.dtype().code == kDLFloat && v_scale_cache.dtype().bits == 32)
+      << "v_scale_cache dtype must be float32";
+
+  // slot_mapping must be int32
+  TVM_FFI_ICHECK(slot_mapping.dtype().code == kDLInt && slot_mapping.dtype().bits == 32)
+      << "slot_mapping dtype must be int32";
+
+  // Validate cache shapes
+  uint32_t k_cache_ndim = k_cache.ndim();
+  uint32_t v_cache_ndim = v_cache.ndim();
+  TVM_FFI_ICHECK(k_cache_ndim == 3 || k_cache_ndim == 4)
+      << "k_cache must be 3D (ragged) or 4D (paged), got " << k_cache_ndim;
+  TVM_FFI_ICHECK(v_cache_ndim == 3 || v_cache_ndim == 4)
+      << "v_cache must be 3D (ragged) or 4D (paged), got " << v_cache_ndim;
+
+  if (k_cache_ndim == 4) {
+    TVM_FFI_ICHECK_EQ(k_cache.size(2), num_kv_heads) << "k_cache num_heads mismatch";
+    TVM_FFI_ICHECK_EQ(k_cache.size(3), head_dim) << "k_cache head_dim mismatch";
+    TVM_FFI_ICHECK_EQ(v_cache.size(2), num_kv_heads) << "v_cache num_heads mismatch";
+    TVM_FFI_ICHECK_EQ(v_cache.size(3), head_dim_v) << "v_cache head_dim_v mismatch";
+    TVM_FFI_ICHECK_EQ(k_scale_cache.ndim(), 3) << "paged k_scale_cache must be 3D";
+    TVM_FFI_ICHECK_EQ(k_scale_cache.size(2), num_kv_heads) << "k_scale_cache num_heads mismatch";
+    TVM_FFI_ICHECK_EQ(v_scale_cache.ndim(), 3) << "paged v_scale_cache must be 3D";
+    TVM_FFI_ICHECK_EQ(v_scale_cache.size(2), num_kv_heads) << "v_scale_cache num_heads mismatch";
+  } else {
+    TVM_FFI_ICHECK_EQ(k_cache.size(1), num_kv_heads) << "ragged k_cache num_heads mismatch";
+    TVM_FFI_ICHECK_EQ(k_cache.size(2), head_dim) << "ragged k_cache head_dim mismatch";
+    TVM_FFI_ICHECK_EQ(v_cache.size(1), num_kv_heads) << "ragged v_cache num_heads mismatch";
+    TVM_FFI_ICHECK_EQ(v_cache.size(2), head_dim_v) << "ragged v_cache head_dim_v mismatch";
+    TVM_FFI_ICHECK_EQ(k_scale_cache.ndim(), 2) << "ragged k_scale_cache must be 2D";
+    TVM_FFI_ICHECK_EQ(k_scale_cache.size(1), num_kv_heads) << "k_scale_cache num_heads mismatch";
+    TVM_FFI_ICHECK_EQ(v_scale_cache.ndim(), 2) << "ragged v_scale_cache must be 2D";
+    TVM_FFI_ICHECK_EQ(v_scale_cache.size(1), num_kv_heads) << "v_scale_cache num_heads mismatch";
+  }
+
+  CHECK_DEVICE(value, key);
+  CHECK_DEVICE(k_cache, key);
+  CHECK_DEVICE(v_cache, key);
+  CHECK_DEVICE(k_scale_cache, key);
+  CHECK_DEVICE(v_scale_cache, key);
+  CHECK_DEVICE(slot_mapping, key);
+
+  // Extract stride_n and stride_h for cache, stride_h for scale cache.
+  // stride_h: stride over num_kv_heads dimension (stride[-2])
+  // stride_n: stride over slot dimension = num_kv_heads * stride_h
+  // stride_hs: stride over num_kv_heads dimension of scale cache (stride[-1])
+  auto k_cache_strides = k_cache.strides();
+  auto v_cache_strides = v_cache.strides();
+  auto k_scale_strides = k_scale_cache.strides();
+  auto v_scale_strides = v_scale_cache.strides();
+
+  int64_t stride_kc_h = k_cache_strides[k_cache_ndim - 2];
+  int64_t stride_kc_n = static_cast<int64_t>(num_kv_heads) * stride_kc_h;
+  int64_t stride_vc_h = v_cache_strides[v_cache_ndim - 2];
+  int64_t stride_vc_n = static_cast<int64_t>(num_kv_heads) * stride_vc_h;
+  int64_t stride_ks_h = k_scale_strides[k_scale_cache.ndim() - 1];
+  int64_t stride_vs_h = v_scale_strides[v_scale_cache.ndim() - 1];
+
+  ffi::CUDADeviceGuard device_guard(key.device().device_id);
+  const cudaStream_t stream = get_stream(key.device());
+
+  // Dispatch input dtype
+  bool input_dispatched = DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(key.dtype(), DTypeIn, [&]() {
+    // Dispatch cache FP8 dtype
+    return DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP8(k_cache.dtype(), DTypeCache, [&]() {
+      cudaError_t status = ReshapeAndCacheFlashPerTokenHead<DTypeIn, DTypeCache>(
+          static_cast<const DTypeIn*>(key.data_ptr()),
+          static_cast<const DTypeIn*>(value.data_ptr()),
+          static_cast<DTypeCache*>(k_cache.data_ptr()),
+          static_cast<DTypeCache*>(v_cache.data_ptr()),
+          static_cast<float*>(k_scale_cache.data_ptr()),
+          static_cast<float*>(v_scale_cache.data_ptr()),
+          static_cast<const int32_t*>(slot_mapping.data_ptr()), num_tokens, num_kv_heads, head_dim,
+          head_dim_v, stride_kc_n, stride_kc_h, stride_vc_n, stride_vc_h, stride_ks_h, stride_vs_h,
+          stream);
+      TVM_FFI_ICHECK(status == cudaSuccess)
+          << "ReshapeAndCacheFlashPerTokenHead failed with error: " << cudaGetErrorString(status);
+      return true;
+    });
+  });
+
+  TVM_FFI_ICHECK(input_dispatched)
+      << "ReshapeAndCacheFlashPerTokenHead failed to dispatch input dtype " << key.dtype();
+}
